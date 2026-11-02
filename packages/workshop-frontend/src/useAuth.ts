@@ -1,6 +1,10 @@
 import { useState, useEffect, useRef } from 'react'
 import { RpcStub } from 'capnweb'
 import { PublicApi, AuthenticatedApi } from '@gadgets/workshop-shared/api'
+import { setReportedUserId } from './errorReporting'
+import { NativeConnectSession } from './features/native-app/connectSession'
+import { browserPushSupport, disableBrowserPush } from './features/notifications/browserPush'
+import { disconnectNativeNotificationEnrollment } from './features/notifications/nativeNotificationEnrollment'
 
 const CF_ACCESS_MODE = import.meta.env.VITE_CF_ACCESS_MODE === 'true'
 
@@ -14,6 +18,7 @@ interface AuthState {
 export { CF_ACCESS_MODE }
 
 export function useAuth(publicApi: RpcStub<PublicApi>) {
+  const [nativeConnectSession] = useState(() => new NativeConnectSession())
   const [authState, setAuthState] = useState<AuthState>({
     token: null,
     authenticatedApi: null,
@@ -25,6 +30,36 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
   // State closures go stale in cleanup functions, so we use a ref.
   const authenticatedApiRef = useRef<RpcStub<AuthenticatedApi> | null>(null)
   authenticatedApiRef.current = authState.authenticatedApi
+
+  /**
+   * Names the signed-in user on error reports, for as long as this stub is the current one.
+   *
+   * Keyed on the stub rather than called from each authenticate path, so it covers however the
+   * session was established — stored token, inline login, or CF Access. This is why the claim lives
+   * in the hook and not in `AuthProvider`: the public blueprint page renders outside that provider
+   * and logs in inline, so reports from the rest of its session would otherwise name nobody.
+   *
+   * `whoami` is pipelined rather than awaited, so its answer can outlive the session that asked.
+   * The cleanup drops it when the stub is replaced or cleared, which is what stops a logout or a
+   * newer login from being overwritten by the previous user. Disposal would not be enough on its
+   * own: capnweb does not guarantee that disposing a stub rejects calls already in flight.
+   *
+   * Nothing is cleared here. Cleanup also runs on unmount, and two instances of this hook can be
+   * mounted at once — the blueprint page runs its own inside the root's — so an inner one going
+   * away must not blank an identity the outer still holds. `logout` is the only thing that clears.
+   */
+  useEffect(() => {
+    const authenticatedApi = authState.authenticatedApi
+    if (!authenticatedApi) return
+    let cancelled = false
+    const identity = authenticatedApi.whoami()
+    const untrack = nativeConnectSession.track(authenticatedApi, identity)
+    identity.then((info) => {
+      // Only a real user account names a person: for a gadget author `id` is its owner's id.
+      if (!cancelled && info.type === 'user') setReportedUserId(info.id)
+    }).catch(() => {})
+    return () => { cancelled = true; untrack() }
+  }, [authState.authenticatedApi, nativeConnectSession])
 
   useEffect(() => {
     if (CF_ACCESS_MODE) {
@@ -94,16 +129,20 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
   }
 
   const logout = () => {
-    if (CF_ACCESS_MODE) {
-      window.location.assign('/cdn-cgi/access/logout')
-      return
+    try {
+      disconnectNativeNotificationEnrollment()
+    } catch (error) {
+      console.error('Failed to disconnect native notifications:', error)
     }
+    setReportedUserId(undefined)
+    // On a shared computer, signing out is how the user stops this browser showing their chats.
+    const releasePush = browserPushSupport() === 'supported'
+      ? disableBrowserPush().catch(error =>
+          console.error('Failed to stop browser notifications:', error))
+      : Promise.resolve()
 
-    // Use functional updater to read current state (avoids stale closure).
     setAuthState(prev => {
-      if (prev.authenticatedApi) {
-        prev.authenticatedApi[Symbol.dispose]()
-      }
+      prev.authenticatedApi?.[Symbol.dispose]()
       return {
         token: null,
         authenticatedApi: null,
@@ -111,8 +150,12 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
         error: null
       }
     })
-
     localStorage.removeItem('authToken')
+
+    if (CF_ACCESS_MODE) {
+      void releasePush.then(() => window.location.assign('/cdn-cgi/access/logout'))
+      return
+    }
   }
 
   return {

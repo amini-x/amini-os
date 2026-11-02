@@ -20,6 +20,7 @@ interface ConnectConnectorModalProps {
   autoProvisions?: boolean
   onOpenChange: (open: boolean) => void
   connecting?: boolean
+  onCancelConnect?: () => void
   // Connect mode: invoked with the `urlPattern`s of the grantable resources the user chose to
   // enable. `undefined` means "enable everything" (no toggle was deselected), matching the
   // gatekeeper's default behavior.
@@ -45,6 +46,7 @@ export default function ConnectConnectorModal({
   autoProvisions = false,
   onOpenChange,
   connecting = false,
+  onCancelConnect,
   onConfirm,
   accountDescription,
   credentialsValid = true,
@@ -204,7 +206,7 @@ export default function ConnectConnectorModal({
       }}
     >
       <Dialog
-        className="!z-[1000] !top-[clamp(28px,8vh,80px)] !flex !max-h-[calc(100vh-clamp(28px,8vh,80px)-28px)] !w-[min(640px,calc(100vw-32px))] !-translate-y-0 flex-col overflow-hidden bg-kumo-base p-0"
+        className="responsive-dialog connect-connector-dialog !z-[1000] !top-[clamp(28px,8vh,80px)] !flex !max-h-[calc(100vh-clamp(28px,8vh,80px)-28px)] !w-[min(640px,calc(100vw-32px))] !-translate-y-0 flex-col overflow-hidden bg-kumo-base p-0"
         size="lg"
       >
         <div className="shrink-0 flex items-start justify-between gap-4 border-b border-kumo-line px-5 py-4">
@@ -412,13 +414,17 @@ export default function ConnectConnectorModal({
               </>
             ) : (
               <>
-                <Dialog.Close
+                {connecting && onCancelConnect ? (
+                  <WorkshopButton onClick={onCancelConnect} className="!h-9">
+                    Cancel connection
+                  </WorkshopButton>
+                ) : <Dialog.Close
                   render={(props) => (
                     <WorkshopButton {...props} disabled={connecting} className="!h-9">
                       Cancel
                     </WorkshopButton>
                   )}
-                />
+                />}
                 <WorkshopButton
                   tone="primary"
                   onClick={handleConfirm}

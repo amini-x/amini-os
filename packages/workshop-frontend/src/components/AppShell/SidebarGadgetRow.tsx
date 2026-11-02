@@ -1,9 +1,12 @@
 import { Link } from '@tanstack/react-router'
-import { DotsThree, Star, ShareNetwork, Trash, Pencil } from '@phosphor-icons/react'
+import { BellSlash, DotsThree, Star, ShareNetwork, Trash, Pencil } from '@phosphor-icons/react'
 import { DropdownMenu } from '@cloudflare/kumo'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER, MENU_POSITIONER_STYLE } from '../menuStyles'
 import { useState, useEffect, useRef } from 'react'
-import type { GadgetMetadataWithTimestamps } from '@gadgets/workshop-shared/api'
+import type { WorkspaceMetadataWithTimestamps, NotificationMute } from '@gadgets/workshop-shared/api'
+import { WorkspaceNotificationsMenu } from '../../features/notifications/WorkspaceNotificationsMenu'
+import { describeMute } from '../../features/notifications/notificationMute'
+import { isImeComposing } from '../../keyboardEvent'
 
 function initials(title: string | undefined): string {
   const t = (title || 'Untitled').trim()
@@ -12,23 +15,27 @@ function initials(title: string | undefined): string {
   return parts.map((p) => p[0]?.toUpperCase() ?? '').join('') || t.slice(0, 2).toUpperCase()
 }
 
-// One row in the sidebar's Favorites / Recent list. Compact, with a monogram avatar, a truncated
-// title, and an overflow menu (favorite, rename, share, delete). Favorite/rename/share/delete
-// callbacks are passed in by the parent so this row stays a pure presentational component.
+/**
+ * One row in the sidebar's Favorites / Recent list. Compact, with a monogram avatar, a truncated
+ * title, and an overflow menu (favorite, rename, share, notifications, delete). Its callbacks are
+ * passed in by the parent so this row stays a pure presentational component.
+ */
 export default function SidebarGadgetRow({
   gadget,
   collapsed = false,
   onTogglePin,
   onRename,
   onShare,
+  onNotificationMuteChange,
   onDelete,
 }: {
-  gadget: GadgetMetadataWithTimestamps
+  gadget: WorkspaceMetadataWithTimestamps
   collapsed?: boolean
-  onTogglePin: (g: GadgetMetadataWithTimestamps) => void
-  onRename: (g: GadgetMetadataWithTimestamps, newTitle: string) => void
-  onShare: (g: GadgetMetadataWithTimestamps) => void
-  onDelete: (g: GadgetMetadataWithTimestamps) => void
+  onTogglePin: (g: WorkspaceMetadataWithTimestamps) => void
+  onRename: (g: WorkspaceMetadataWithTimestamps, newTitle: string) => void
+  onShare: (g: WorkspaceMetadataWithTimestamps) => void
+  onNotificationMuteChange: (g: WorkspaceMetadataWithTimestamps, mute: NotificationMute | undefined) => void
+  onDelete: (g: WorkspaceMetadataWithTimestamps) => void
 }) {
   const [renaming, setRenaming] = useState(false)
   const [renameValue, setRenameValue] = useState(gadget.title || '')
@@ -48,6 +55,8 @@ export default function SidebarGadgetRow({
     setRenameValue(gadget.title || '')
     setRenaming(true)
   }
+
+  const muteDescription = describeMute(gadget.notificationMute)
 
   return (
     <Link
@@ -76,6 +85,7 @@ export default function SidebarGadgetRow({
               onChange={(e) => setRenameValue(e.target.value)}
               onBlur={commit}
               onKeyDown={(e) => {
+                if (isImeComposing(e)) return
                 if (e.key === 'Enter') commit()
                 if (e.key === 'Escape') setRenaming(false)
               }}
@@ -84,6 +94,9 @@ export default function SidebarGadgetRow({
             />
           ) : (
             <span className="min-w-0 flex-1 truncate">{gadget.title || 'Untitled workspace'}</span>
+          )}
+          {muteDescription && (
+            <BellSlash size={12} alt={muteDescription} className="shrink-0 text-kumo-inactive" />
           )}
 
           {/* Inside the row's <Link>: stopPropagation blocks the Link's SPA handler, so preventDefault
@@ -121,6 +134,11 @@ export default function SidebarGadgetRow({
                 >
                   <ShareNetwork size={13} className="mr-2" /> Share
                 </DropdownMenu.Item>
+                <WorkspaceNotificationsMenu
+                  workspaceId={gadget.id}
+                  mute={gadget.notificationMute}
+                  onMuteChange={(mute) => onNotificationMuteChange(gadget, mute)}
+                />
                 <DropdownMenu.Separator />
                 <DropdownMenu.Item
                   variant="danger"

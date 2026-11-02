@@ -12,9 +12,11 @@ import { siteLogoImage } from "./site-logo.js";
 
 const logger = createWorkshopLogger("workshop.deployment.config");
 
-// Resolve the auth-capable, allowlisted gatekeeper vendors offered as sign-in methods, querying
-// each gatekeeper's describe() for display info. Skips vendors with no binding, that don't advertise
-// providesAuth, or that error.
+/**
+ * Resolve the auth-capable, allowlisted gatekeeper vendors offered as sign-in methods, querying
+ * each gatekeeper's describe() for display info. Skips vendors with no binding, that don't advertise
+ * providesAuth, or that error.
+ */
 export async function getAuthVendors(env: Cloudflare.Env): Promise<AuthVendorInfo[]> {
   // describe() is a cross-Worker RPC and getServerConfig() runs on every (re)connect, so query the
   // allowlisted vendors in parallel rather than serially. Order is preserved (Promise.all), so the
@@ -37,6 +39,11 @@ export async function getAuthVendors(env: Cloudflare.Env): Promise<AuthVendorInf
   return results.filter((v): v is AuthVendorInfo => v !== null);
 }
 
+/** This backend version's id, or undefined where it has none; see ServerConfig.backendVersion. */
+export function backendVersion(env: Cloudflare.Env): string | undefined {
+  return env.CF_VERSION_METADATA?.id || undefined;
+}
+
 export async function getServerConfig(env: Cloudflare.Env): Promise<ServerConfig> {
   // The admin-config KV get and the per-vendor describe() RPCs are independent — run them
   // concurrently so the KV get isn't serialized ahead of N cross-Worker calls on every (re)connect.
@@ -50,11 +57,14 @@ export async function getServerConfig(env: Cloudflare.Env): Promise<ServerConfig
     passwordAuthEnabled: isPasswordAuthEnabled(env),
     cloudflareLimitsEnabled: isCloudflareLimitsEnabled(env),
     signupsEnabled: config.signupsEnabled,
+    userSearchEnabled: config.userSearchEnabled,
     siteName: config.siteName,
     siteLogo: siteLogoImage(config.siteLogoConfigured),
     announcement: config.announcement,
     banner: config.banner.text,
     bannerColor: config.banner.color,
     accentColor: config.accentColor,
+    webPushPublicKey: env.NOTIFICATION_WEB_PUSH_PUBLIC_KEY,
+    backendVersion: backendVersion(env),
   };
 }

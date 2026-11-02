@@ -13,6 +13,18 @@ describe('export file transfers', () => {
       .toBe('Quarterly-report-2026.csv')
   })
 
+  it('uses a custom full filename without appending another extension', () => {
+    expect(makeExportFilename('Gadget title', '.pdf', 'one-pager.pdf'))
+      .toBe('one-pager.pdf')
+  })
+
+  it('sanitizes custom filenames and falls back when nothing remains', () => {
+    expect(makeExportFilename('Gadget title', '.pdf', ' reports / one-pager.pdf '))
+      .toBe('reports-one-pager.pdf')
+    expect(makeExportFilename('Gadget title', '.pdf', ' / '))
+      .toBe('Gadget-title.pdf')
+  })
+
   it('opens the picker before starting the export stream', async () => {
     const order: string[] = []
     const picker = vi.fn<(_options: unknown) => Promise<{
@@ -85,6 +97,33 @@ describe('export file transfers', () => {
     )).rejects.toThrow('picker failed')
 
     expect(source).not.toHaveBeenCalled()
+  })
+
+  it('preserves the advertised content type in the Blob fallback', async () => {
+    const createObjectURL = vi.fn<(blob: Blob) => string>(() => 'blob:test')
+    const oldCreateObjectURL = URL.createObjectURL
+    const oldRevokeObjectURL = URL.revokeObjectURL
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    URL.createObjectURL = createObjectURL
+    URL.revokeObjectURL = vi.fn<(url: string) => void>()
+    try {
+      await saveStreamToFile(
+        async () => new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('a,b'))
+            controller.close()
+          },
+        }),
+        'report.csv',
+        { description: 'CSV', contentType: 'text/csv', extension: '.csv' },
+      )
+
+      expect(createObjectURL.mock.calls[0]?.[0].type).toBe('text/csv')
+    } finally {
+      URL.createObjectURL = oldCreateObjectURL
+      URL.revokeObjectURL = oldRevokeObjectURL
+      click.mockRestore()
+    }
   })
 
 })

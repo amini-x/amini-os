@@ -19,6 +19,7 @@ import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
   type AccountDescription,
   type ApprovalQueue,
+  type ConnectHandoff,
   type Gatekeeper,
   type GatekeeperConnectCallback,
   type GatekeeperConnectOptions,
@@ -30,7 +31,11 @@ import {
   type ResourceDescription,
   type SupportedResource,
   type VendorDescription,
+  workerVersionTag,
 } from "@gadgets/workshop-shared/gatekeeper";
+import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import { SingleFlight } from "@gadgets/gatekeeper-kit/single-flight";
 import {
   CONFLUENCE_SCOPES,
   ConfluenceApi,
@@ -74,7 +79,7 @@ import {
   type ConfluenceAction,
   type ContentParent,
 } from "./confluence-actions";
-import { ConfluenceConfiguratorUI } from "./confluence-configurators";
+import { ConfluenceConfiguratorUI } from "./confluence-configurator";
 import {
   ConfluenceAccessChecker,
   ConfluenceObserverTracker,
@@ -108,9 +113,7 @@ import type {
 } from "./types";
 import CONFLUENCE_LOGO_SVG from "./confluence-logo.svg";
 import TYPES_CODE from "./types.txt";
-import SITE_CONFIGURATOR_HTML from "./generated/confluence-site-configurator-ui.txt";
-import SPACE_CONFIGURATOR_HTML from "./generated/confluence-space-configurator-ui.txt";
-import PAGE_CONFIGURATOR_HTML from "./generated/confluence-page-configurator-ui.txt";
+import CONFIGURATOR_HTML from "./generated/confluence-configurator-ui.txt";
 
 // ---------------------------------------------------------------------------------------------
 // Constants & helpers
@@ -128,8 +131,19 @@ type Env = Cloudflare.Env & {
   CLIENT_SECRET?: string;
 };
 
-type StoredNonce = { value: string; expiresAt: number; stage: "initiation" | "oauth" };
-type StoredGrant = { accessToken: string; refreshToken?: string; expiresAt: number };
+type StoredNonce = {
+  value: string;
+  expiresAt: number;
+  stage: "initiation" | "oauth";
+  /**
+   * Set when this flow reconnects an existing account, so its grant is staged rather than made
+   * live. The mode travels with the flow instead of living on the account: committing one
+   * reconnect while another is in flight must not change how that other flow lands.
+   */
+  reconnect?: true;
+};
+/** `scopes` is absent from a grant stored before scopes were recorded, until its next refresh. */
+type StoredGrant = { accessToken: string; refreshToken?: string; expiresAt: number; scopes?: string[] };
 
 const getBaseUrl = (env: Env): string => env.BASE_URL || "http://localhost:8787/gatekeeper/confluence";
 const getBasePath = (env: Env): string => new URL(getBaseUrl(env)).pathname;
@@ -148,29 +162,25 @@ function constantTimeEqual(a: string, b: string): boolean {
 
 const CONFLUENCE_LOGO_URL = `data:image/svg+xml,${encodeURIComponent(CONFLUENCE_LOGO_SVG)}`;
 
+// One connect card chooses among the three, so the site type, which leads it, is titled for the card.
 const SITE_RESOURCE: SupportedResource = {
   urlPattern: "https://*.atlassian.net/wiki",
-  title: "Confluence Site",
-  description: "Search, browse, and edit any space or page on a Confluence site.",
+  title: "Confluence",
+  description: "A whole Confluence site, one space, or one page or blog post.",
 };
 const SPACE_RESOURCE: SupportedResource = {
   urlPattern: "https://*.atlassian.net/wiki/spaces/:spaceKey",
   title: "Confluence Space",
   description: "Read and edit the pages and blog posts in a single Confluence space.",
+  groupedWith: SITE_RESOURCE.urlPattern,
 };
 const PAGE_RESOURCE: SupportedResource = {
   urlPattern: "https://*.atlassian.net/wiki/spaces/:spaceKey/pages/:pageId/*?",
   title: "Confluence Page or Blog Post",
   description: "Read and edit a specific Confluence page or blog post (and its child pages).",
+  groupedWith: SITE_RESOURCE.urlPattern,
 };
 const SUPPORTED_RESOURCES = [SITE_RESOURCE, SPACE_RESOURCE, PAGE_RESOURCE];
-
-const htmlResponse = (body: string): Response =>
-  new Response(body, { headers: { "Content-Type": "text/html; charset=utf-8" } });
-
-const SELF_CLOSING_HTML = `<!DOCTYPE html>
-<html lang="en"><body><script>window.close();</script>
-<p>Authorization complete. You may close this tab and return to Cloudflare OS.</p></body></html>`;
 
 const page = (title: string, color: string, message: string): string => `<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><title>${title}</title></head>
@@ -180,7 +190,7 @@ const page = (title: string, color: string, message: string): string => `<!DOCTY
 <p style="color: #555; line-height: 1.6;">${message}</p></div></body></html>`;
 
 const INVALID_LINK_HTML = page("Authorization Link Expired", "#d97706",
-  "This authorization link is invalid or has expired. Please return to Cloudflare OS and try again.");
+  "This authorization link is invalid or has expired. Please return to Amini OS and try again.");
 const NOT_CONFIGURED_HTML = page("Confluence Gatekeeper Not Configured", "#d97706",
   "Please configure an Atlassian OAuth client ID and secret for this gatekeeper.");
 
@@ -225,8 +235,9 @@ export default {
       if (colonIdx < 0) return new Response("Error: malformed state",
         { headers: { "content-type": "text/plain; charset=utf-8" } });
       const stub = ctx.exports.UserAccount.get(ctx.exports.UserAccount.idFromString(state.slice(0, colonIdx)));
-      if (!await stub.acceptAuthCode(code, state.slice(colonIdx + 1))) return htmlResponse(INVALID_LINK_HTML);
-      return htmlResponse(SELF_CLOSING_HTML);
+      const handoff = await stub.acceptAuthCode(code, state.slice(colonIdx + 1));
+      if (!handoff) return htmlResponse(INVALID_LINK_HTML);
+      return htmlResponse(connectHandoffPageHtml(handoff));
     }
     return new Response("Not Found", { status: 404 });
   },
@@ -245,10 +256,14 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
       color: "#deebff",
       tagline: "Read and write your Confluence pages and spaces",
       description:
-        "Connect your Atlassian Confluence site to let Cloudflare OS search, read, and edit the pages, " +
+        "Connect your Atlassian Confluence site to let Amini OS search, read, and edit the pages, " +
         "blog posts, and spaces you share. Build agents that draft documentation, organize " +
         "knowledge bases, or keep pages up to date.",
     };
+  }
+
+  async versionTag(): Promise<string | undefined> {
+    return workerVersionTag(this.env);
   }
 
   async connectAccount(
@@ -273,6 +288,10 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
 // UserAccount DO — OAuth credential management (multi-site, rotating refresh tokens).
 
 export class UserAccount extends DurableObject<Env> {
+  // Rotating refresh tokens: concurrent callers (a picker's parallel reads, say) share one refresh,
+  // so one new token is stored rather than the last of several.
+  readonly #refreshes = new SingleFlight<"refresh">();
+
   async setCallback(callback: Fetcher<GatekeeperConnectCallback>, initiationNonce: string) {
     if (!this.ctx.storage.kv.get<StoredGrant>("grant")) {
       this.ctx.storage.setAlarm(Date.now() + CONNECT_TIMEOUT_MS);
@@ -284,9 +303,11 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async prepareReconnect(initiationNonce: string) {
-    this.ctx.storage.kv.put<boolean>("reconnecting", true);
     this.ctx.storage.kv.put<StoredNonce>("nonce", {
-      value: initiationNonce, expiresAt: Date.now() + INITIATION_NONCE_LIFETIME_MS, stage: "initiation",
+      value: initiationNonce,
+      expiresAt: Date.now() + INITIATION_NONCE_LIFETIME_MS,
+      stage: "initiation",
+      reconnect: true,
     });
   }
 
@@ -298,16 +319,23 @@ export class UserAccount extends DurableObject<Env> {
     }
     const oauthNonce = generateNonce();
     this.ctx.storage.kv.put<StoredNonce>("nonce", {
-      value: oauthNonce, expiresAt: Date.now() + OAUTH_NONCE_LIFETIME_MS, stage: "oauth",
+      value: oauthNonce,
+      expiresAt: Date.now() + OAUTH_NONCE_LIFETIME_MS,
+      stage: "oauth",
+      reconnect: stored.reconnect,
     });
     return { oauthNonce };
   }
 
-  async acceptAuthCode(code: string, oauthNonce: string): Promise<boolean> {
+  /**
+   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on, or
+   * null when the callback's nonce doesn't match.
+   */
+  async acceptAuthCode(code: string, oauthNonce: string): Promise<ConnectHandoff | null> {
     const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
     if (!stored || stored.stage !== "oauth" || Date.now() >= stored.expiresAt ||
         !constantTimeEqual(stored.value, oauthNonce)) {
-      return false;
+      return null;
     }
     this.ctx.storage.kv.delete("nonce");
 
@@ -319,22 +347,36 @@ export class UserAccount extends DurableObject<Env> {
 
     const grant = await exchangeAuthCode(
       code, this.env.CLIENT_ID, this.env.CLIENT_SECRET, getBaseUrl(this.env) + "/oauth");
-    this.#storeGrant(grant);
-    await this.#refreshSitesAndIdentity(grant.accessToken);
 
-    if (this.ctx.storage.kv.get<boolean>("reconnecting")) {
-      this.ctx.storage.kv.delete("reconnecting");
-      await callback.credentialsRestored(new Date(grant.expiresAt));
+    let handoff: ConnectHandoff;
+    if (stored.reconnect) {
+      // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
+      // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
+      // gadgets keep reading the current token meanwhile.
+      const stageId = stageCredentials(this.ctx.storage.kv, grant, Date.now());
+      // No expiry is reported: the access token is refreshed transparently from the rotating
+      // refresh token, and GatekeeperConnectCallback says not to report a token-cache expiry.
+      handoff = await callback.reconnectComplete(stageId);
     } else {
+      this.#storeGrant(grant);
+      await this.#refreshSitesAndIdentity(grant.accessToken);
       try {
         const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
-        await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }), new Date(grant.expiresAt));
+        handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
       } catch (err) {
         this.ctx.storage.kv.delete("grant");
         throw err;
       }
     }
-    return true;
+    return handoff;
+  }
+
+  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
+  async commitReconnect(stageId: string): Promise<void> {
+    const grant = commitStagedCredentials<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
+    if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    this.#storeGrant(grant);
+    await this.#refreshSitesAndIdentity(grant.accessToken);
   }
 
   #storeGrant(grant: StoredGrant) {
@@ -350,7 +392,7 @@ export class UserAccount extends DurableObject<Env> {
     if (identity) this.ctx.storage.kv.put<AtlassianIdentity>("identity", identity);
   }
 
-  // Returns a usable access token, refreshing proactively if it is near expiry.
+  /** Returns a usable access token, refreshing proactively if it is near expiry. */
   async getAccessToken(): Promise<string> {
     const grant = this.ctx.storage.kv.get<StoredGrant>("grant");
     if (!grant) throw new ConfluenceApiError(401, "No Confluence credentials set.");
@@ -358,7 +400,11 @@ export class UserAccount extends DurableObject<Env> {
     return grant.accessToken;
   }
 
-  async refreshCredentials(): Promise<string> {
+  refreshCredentials(): Promise<string> {
+    return this.#refreshes.run("refresh", () => this.#refreshCredentials());
+  }
+
+  async #refreshCredentials(): Promise<string> {
     if (!this.env.CLIENT_ID || !this.env.CLIENT_SECRET) {
       throw new Error("The Confluence Gatekeeper is not configured.");
     }
@@ -371,7 +417,7 @@ export class UserAccount extends DurableObject<Env> {
       const next = await refreshAccessToken(grant.refreshToken, this.env.CLIENT_ID, this.env.CLIENT_SECRET);
       this.#storeGrant(next); // rotating refresh token: always persist the new one
       const callback = this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback");
-      callback?.credentialsRestored(new Date(next.expiresAt)).catch(() => {});
+      callback?.credentialsRestored().catch(() => {});
       return next.accessToken;
     } catch (err) {
       if (err instanceof ConfluenceApiError && (err.isAuthError || err.status === 400 || err.status === 403)) {
@@ -392,6 +438,11 @@ export class UserAccount extends DurableObject<Env> {
 
   async getIdentity(): Promise<AtlassianIdentity | null> {
     return this.ctx.storage.kv.get<AtlassianIdentity>("identity") ?? null;
+  }
+
+  /** The scopes the grant holds, or null for a grant stored before scopes were recorded. */
+  async getGrantedScopes(): Promise<string[] | null> {
+    return this.ctx.storage.kv.get<StoredGrant>("grant")?.scopes ?? null;
   }
 
   async alarm() {
@@ -476,18 +527,18 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
   }
 
   async startResourceConfigurator(resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+    // The three types share one card, so each starts the same configurator.
+    if (!SUPPORTED_RESOURCES.some(resource => resource.urlPattern === resourceUrlPattern)) {
+      throw new Error(`Unsupported resource configurator type: ${resourceUrlPattern}`);
+    }
     const account = this.#userAccount();
-    const ui = new ConfluenceConfiguratorUI(
-      async () => await account.getSites(),
-      async () => await account.getAccessToken(),
-    );
-    const html =
-      resourceUrlPattern === SITE_RESOURCE.urlPattern ? SITE_CONFIGURATOR_HTML
-      : resourceUrlPattern === SPACE_RESOURCE.urlPattern ? SPACE_CONFIGURATOR_HTML
-      : resourceUrlPattern === PAGE_RESOURCE.urlPattern ? PAGE_CONFIGURATOR_HTML
-      : null;
-    if (!html) throw new Error(`Unsupported resource configurator type: ${resourceUrlPattern}`);
-    return { iframeHtml: html, ui: new RpcStub(ui) };
+    const ui = new ConfluenceConfiguratorUI({
+      getSites: async () => await account.getSites(),
+      getGrantedScopes: async () => await account.getGrantedScopes(),
+      getToken: async () => await account.getAccessToken(),
+      refresh: async () => await account.refreshCredentials(),
+    });
+    return { iframeHtml: CONFIGURATOR_HTML, ui: new RpcStub(ui) };
   }
 
   async revoke(): Promise<void> {
@@ -498,6 +549,10 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     const initiationNonce = generateNonce();
     await this.#userAccount().prepareReconnect(initiationNonce);
     return { url: `${getBaseUrl(this.env)}/${this.ctx.props.userObjectId}/${initiationNonce}` };
+  }
+
+  async commitReconnect(stageId: string): Promise<void> {
+    await this.#userAccount().commitReconnect(stageId);
   }
 
   @skipRpcValidation()
@@ -568,7 +623,7 @@ function makeApi(ctx: { exports: Cloudflare.Env }, props: BaseProps): Confluence
 @validateRpc()
 export class ConfluenceSiteGatekeeperImpl extends DurableObject<Env, SiteGatekeeperProps>
     implements Gatekeeper<ConfluenceSiteSession> {
-  #store() { return new ConfluenceStore(this.ctx.storage.kv, makeApi(this.ctx, this.ctx.props)); }
+  #store() { return new ConfluenceStore(this.ctx.storage, makeApi(this.ctx, this.ctx.props)); }
   #tracker() { return new ConfluenceObserverTracker(this.ctx.storage.kv, this.ctx.props.cloudId); }
 
   async describe(): Promise<ResourceDescription> {
@@ -595,8 +650,10 @@ export class ConfluenceSiteGatekeeperImpl extends DurableObject<Env, SiteGatekee
       sets => this.#tracker().prepareObservation(sets));
   }
 
-  // Site membership is the baseline for site metadata/current-user reads. The tracker separately
-  // verifies every restricted space and content item revealed through this broad binding.
+  /**
+   * Site membership is the baseline for site metadata/current-user reads. The tracker separately
+   * verifies every restricted space and content item revealed through this broad binding.
+   */
   async addObserver(id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
     const verifier = user as unknown as Fetcher<ConfluenceVerifierApi>;
     if (!(await verifier.hasSiteAccess(this.ctx.props.cloudId))) {
@@ -615,7 +672,7 @@ export class ConfluenceSiteGatekeeperImpl extends DurableObject<Env, SiteGatekee
 @validateRpc()
 export class ConfluenceSpaceGatekeeperImpl extends DurableObject<Env, SpaceGatekeeperProps>
     implements Gatekeeper<ConfluenceSpaceSession> {
-  #store() { return new ConfluenceStore(this.ctx.storage.kv, makeApi(this.ctx, this.ctx.props)); }
+  #store() { return new ConfluenceStore(this.ctx.storage, makeApi(this.ctx, this.ctx.props)); }
   #tracker() { return new ConfluenceObserverTracker(this.ctx.storage.kv, this.ctx.props.cloudId); }
 
   async describe(): Promise<ResourceDescription> {
@@ -639,8 +696,10 @@ export class ConfluenceSpaceGatekeeperImpl extends DurableObject<Env, SpaceGatek
       sets => this.#tracker().prepareObservation(sets));
   }
 
-  // Space access is the baseline; pages and blog posts are tracked independently because
-  // Confluence content restrictions may be narrower than the containing space.
+  /**
+   * Space access is the baseline; pages and blog posts are tracked independently because
+   * Confluence content restrictions may be narrower than the containing space.
+   */
   async addObserver(id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
     const verifier = user as unknown as Fetcher<ConfluenceVerifierApi>;
     if (!(await verifier.hasSpaceAccess(this.ctx.props.cloudId, this.ctx.props.spaceKey))) {
@@ -659,7 +718,7 @@ export class ConfluenceSpaceGatekeeperImpl extends DurableObject<Env, SpaceGatek
 @validateRpc()
 export class ConfluenceContentGatekeeperImpl extends DurableObject<Env, ContentGatekeeperProps>
     implements Gatekeeper<ConfluenceContentSession> {
-  #store() { return new ConfluenceStore(this.ctx.storage.kv, makeApi(this.ctx, this.ctx.props)); }
+  #store() { return new ConfluenceStore(this.ctx.storage, makeApi(this.ctx, this.ctx.props)); }
   #tracker() { return new ConfluenceObserverTracker(this.ctx.storage.kv, this.ctx.props.cloudId); }
 
   async describe(): Promise<ResourceDescription> {
@@ -684,8 +743,10 @@ export class ConfluenceContentGatekeeperImpl extends DurableObject<Env, ContentG
       sets => this.#tracker().prepareObservation(sets));
   }
 
-  // Access to the bound page/blog post is the baseline. Child pages remain tracked sets because a
-  // descendant can have stricter restrictions than its parent.
+  /**
+   * Access to the bound page/blog post is the baseline. Child pages remain tracked sets because a
+   * descendant can have stricter restrictions than its parent.
+   */
   async addObserver(id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
     const verifier = user as unknown as Fetcher<ConfluenceVerifierApi>;
     if (!(await verifier.hasContentAccess(this.ctx.props.cloudId, this.ctx.props.contentId))) {
@@ -1045,6 +1106,9 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
     }
     const create = this.#store.createActionFor(this.#contentId)?.action;
     const spaceKey = await this.#spaceKey(create);
+    // The description names the parent's space, read from the parent itself.
+    await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, this.#sets(),
+      observation("Read Confluence parent page", "Read the space of the page a child page is created under."));
     const provisionalId = this.#store.nextProvisionalId();
     await this.#stage({
       type: "createContent", provisionalId, kind: "page",
@@ -1131,14 +1195,16 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
   }
 
   async uploadAttachment(options: UploadAttachmentOptions): Promise<Attachment> {
+    // Staging deletes the action, and its file with it, if approval submission fails.
+    const file = await this.#store.captureAttachment(options.data);
     await this.#stage({
       type: "uploadAttachment", contentId: this.#contentId,
-      filename: options.filename, mediaType: options.mediaType, data: options.data, comment: options.comment,
+      filename: options.filename, mediaType: options.mediaType, file, comment: options.comment,
     });
     // Reflect the pending upload optimistically (it isn't applied until approved). Use a fresh
     // provisional id (like createContent) so concurrent pending uploads don't share one id.
     return { id: this.#store.nextProvisionalId(), title: options.filename, mediaType: options.mediaType,
-      fileSize: options.data.byteLength, version: 1, createdAt: new Date() };
+      fileSize: file.size, version: 1, createdAt: new Date() };
   }
 
   async trash(): Promise<void> {

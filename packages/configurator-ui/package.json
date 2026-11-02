@@ -2,22 +2,45 @@
   "name": "@gadgets/configurator-ui",
   "version": "1.0.0",
   "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./src/index.ts",
       "import": "./src/index.ts"
+    },
+    "./options": {
+      "types": "./src/runtime/options.ts",
+      "import": "./src/runtime/options.ts"
     }
   },
   "scripts": {
     "build": "tsc",
-    "types:check": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "test": "vitest run --passWithNoTests"
+    "test:run": "vitest run && vitest run -c vitest.browser.config.ts"
+  },
+  "dependencies": {
+    "@cloudflare/kumo": "^2.14.0",
+    "@gadgets/error-reporting": "workspace:*",
+    "@phosphor-icons/react": "^2.1.10",
+    "@tailwindcss/node": "^4.3.3",
+    "@tailwindcss/oxide": "^4.3.3",
+    "capnweb": "catalog:",
+    "capnweb-validate": "catalog:",
+    "esbuild": "^0.28.2",
+    "preact": "^11.0.1",
+    "tailwindcss": "^4.3.3",
+    "typescript6": "catalog:"
   },
   "devDependencies": {
-    "typescript": "^5.9.3",
-    "vitest": "^4.1.10"
+    "@gadgets/scripts": "workspace:*",
+    "@gadgets/workshop-shared": "workspace:*",
+    "@types/node": "26.1.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitest/browser-playwright": "catalog:",
+    "playwright": "catalog:",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
   }
 }

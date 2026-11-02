@@ -13,10 +13,10 @@ type Navigate = ReturnType<typeof useNavigate>
 type Toasts = ReturnType<typeof useKumoToastManager>
 
 export type OutputFormats = {
-  // Empty until loaded, and on failure; callers render nothing rather than a spinner.
+  /** Empty until loaded, and on failure; callers render nothing rather than a spinner. */
   formats: OutputFormatOffer[]
 
-  // The blueprint id currently being instantiated, for a busy affordance.
+  /** The blueprint id currently being instantiated, for a busy affordance. */
   creating: string | null
 
   create: (format: OutputFormatOffer) => Promise<void>
@@ -44,9 +44,11 @@ function loadOutputFormats(api: AuthenticatedApiStub): Promise<OutputFormatOffer
   return loaded
 }
 
-// Instantiate a format, or route to its blueprint's landing page when it needs bindings wired up
-// first. Not a hook: the command palette calls this from its own command list, where a hook can't
-// go.
+/**
+ * Instantiate a format, or route to its blueprint's landing page when it needs bindings wired up
+ * first. Not a hook: the command palette calls this from its own command list, where a hook can't
+ * go.
+ */
 export async function createFromFormat(
   api: AuthenticatedApiStub,
   navigate: Navigate,
@@ -63,7 +65,7 @@ export async function createFromFormat(
   // anywhere in the bundle is a parse error that fails the whole chunk.
   let overseer: RpcStub<Overseer> | undefined
   try {
-    overseer = await api.newGadgetFromBlueprint(format.blueprintId, {})
+    overseer = await api.newWorkspaceFromBlueprint(format.blueprintId, {})
     const { id } = await overseer.getMetadata()
     navigate({ to: '/workspace/$id', params: { id } })
   } catch (err) {

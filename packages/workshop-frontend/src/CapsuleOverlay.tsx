@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type Mutable
 import { AccountDescription, SupportedResource, VendorDescription } from '@gadgets/workshop-shared/gatekeeper'
 import { useAuthenticatedApi } from './AuthContext'
 import ResourcePicker, { type SelectableItem } from './ResourcePicker'
+import { KeyHint } from './components/pickerRows'
 import styles from './CapsuleOverlay.module.css'
 
 export interface CapsuleOverlayProps {
@@ -18,15 +19,17 @@ export interface CapsuleOverlayProps {
   activeIndex?: number
   onItems?: (items: SelectableItem[]) => void
   activateRef?: MutableRefObject<((index: number) => void) | null>
-  // Distance from the bottom of the positioning parent to the line the URL is on, so the panel sits
-  // with that line rather than above the whole composer.
+  /**
+   * Distance from the bottom of the positioning parent to the line the URL is on, so the panel sits
+   * with that line rather than above the whole composer.
+   */
   lineOffset?: number
 }
 
 // Minimum URL length to trigger showing the overlay (show once the scheme is complete).
 const MIN_URL_LENGTH = 'http://'.length
 
-// Gap between the panel and the line it points at. Matches the offset in CapsuleOverlay.module.css.
+/** Gap between the panel and the line it points at. Matches the offset in CapsuleOverlay.module.css. */
 export const CAPSULE_OVERLAY_GAP = 8
 
 // Breathing room kept between the top of the panel and the top of the window. Generous, because the
@@ -40,6 +43,7 @@ const MIN_OVERLAY_HEIGHT = 160
 export default function CapsuleOverlay({ url, onSelectAccount, onRefine, onDismiss, activeIndex, onItems, activateRef, lineOffset }: CapsuleOverlayProps) {
   const { authenticatedApi } = useAuthenticatedApi()
   const overlayRef = useRef<HTMLDivElement>(null)
+  const footerRef = useRef<HTMLParagraphElement>(null)
   // A list that fills in row by row moves under the pointer and shuffles what Tab is aimed at, so
   // the panel stays out of the way until there is a list to show.
   const [ready, setReady] = useState(false)
@@ -47,15 +51,15 @@ export default function CapsuleOverlay({ url, onSelectAccount, onRefine, onDismi
 
   // The panel is anchored to the bottom, so it grows upward and can run past the top of the window
   // -- on Home the composer sits mid-page, leaving only a few hundred pixels above it. Measure what
-  // is actually there and let the list scroll in the rest. The anchored edge doesn't move when the
-  // content resizes, so one measurement per layout is enough.
+  // is actually there and let the list scroll in what the footer leaves. The anchored edge doesn't
+  // move when the content resizes, so one measurement per layout is enough.
   const [maxHeight, setMaxHeight] = useState<number>()
   useLayoutEffect(() => {
     const node = overlayRef.current
     if (!node) return
     const measure = () => {
-      const bottom = node.getBoundingClientRect().bottom
-      setMaxHeight(Math.max(MIN_OVERLAY_HEIGHT, bottom - OVERLAY_VIEWPORT_MARGIN))
+      const room = node.getBoundingClientRect().bottom - (footerRef.current?.offsetHeight ?? 0)
+      setMaxHeight(Math.max(MIN_OVERLAY_HEIGHT, room - OVERLAY_VIEWPORT_MARGIN))
     }
     measure()
     window.addEventListener('resize', measure)
@@ -96,6 +100,13 @@ export default function CapsuleOverlay({ url, onSelectAccount, onRefine, onDismi
         onItems={onItems}
         activateRef={activateRef}
       />
+      <p
+        ref={footerRef}
+        aria-hidden="true"
+        className="m-0 flex items-center justify-end gap-1.5 border-t border-kumo-line px-3.5 py-1.5 text-[11.5px] leading-4 text-kumo-subtle"
+      >
+        <KeyHint keyName="Esc" /> to dismiss
+      </p>
     </div>
   )
 }
