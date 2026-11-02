@@ -59,17 +59,17 @@ describe("service worker", () => {
 
   it("shows the notification a push carries", async () => {
     await push(JSON.stringify(
-      { title: "Cloudflare OS", body: "Build the demo is complete.", path: PATH, tag: "t1" }));
+      { title: "Amini OS", body: "Build the demo is complete.", path: PATH, tag: "t1" }));
 
     expect(scope.registration.showNotification).toHaveBeenCalledWith(
-      "Cloudflare OS", { body: "Build the demo is complete.", tag: "t1", data: { path: PATH } });
+      "Amini OS", { body: "Build the demo is complete.", tag: "t1", data: { path: PATH } });
   });
 
   it("still shows a notification for a push it can't read", async () => {
     await push("Test push message from DevTools.");
 
     expect(scope.registration.showNotification).toHaveBeenCalledWith(
-      "Cloudflare OS", expect.objectContaining({ data: { path: "/" } }));
+      "Amini OS", expect.objectContaining({ data: { path: "/" } }));
   });
 
   it.each([
@@ -78,10 +78,10 @@ describe("service worker", () => {
     ["a backslash path that URL parsing reads as protocol-relative", "/\\evil.example/x"],
     ["no path", undefined],
   ])("keeps a click on this origin when a push names %s", async (_case, path) => {
-    await push(JSON.stringify({ title: "Cloudflare OS", path }));
+    await push(JSON.stringify({ title: "Amini OS", path }));
 
     expect(scope.registration.showNotification).toHaveBeenCalledWith(
-      "Cloudflare OS", expect.objectContaining({ data: { path: "/" } }));
+      "Amini OS", expect.objectContaining({ data: { path: "/" } }));
   });
 
   it("brings an open window forward to open the chat", async () => {
