@@ -7,14 +7,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const testState = vi.hoisted(() => {
   const listModels = vi.fn<() => Promise<never[]>>(async () => []);
-  const newGadget = vi.fn<() => never>();
+  const newWorkspace = vi.fn<() => never>();
   return {
     addToast: vi.fn<(toast: unknown) => void>(),
-    authenticatedApi: { listModels, newGadget },
+    authenticatedApi: { listModels, newWorkspace },
+    currentUser: { id: "user-a", name: "User A" },
     listModels,
     navigate: vi.fn<(options: unknown) => void>(),
-    newGadget,
+    newWorkspace,
     seeds: [] as Array<{ text?: string; nonce?: number }>,
+    draftStorageKeys: [] as Array<string | undefined>,
   };
 });
 
@@ -30,18 +32,25 @@ vi.mock("@cloudflare/kumo", () => ({
 vi.mock("./AuthContext", () => ({
   useAuthenticatedApi: () => ({
     authenticatedApi: testState.authenticatedApi,
+    currentUser: testState.currentUser,
   }),
 }));
 
-vi.mock("./ChatInterface", () => ({
-  ChatInput: ({ seedText, seedNonce }: { seedText?: string; seedNonce?: number }) => {
+vi.mock("./features/chat/composer/ChatComposer", () => ({
+  ChatComposer: ({ seedText, seedNonce, draftStorageKey }: {
+    seedText?: string;
+    seedNonce?: number;
+    draftStorageKey?: string;
+  }) => {
     testState.seeds.push({ text: seedText, nonce: seedNonce });
+    testState.draftStorageKeys.push(draftStorageKey);
     return <textarea aria-label="Prompt" readOnly value={seedText ?? ""} />;
   },
 }));
 
 vi.mock("./components/MeshBackground", () => ({ default: () => null }));
 vi.mock("./components/AppShell/HomeTaskSuggestions", () => ({ default: () => null }));
+vi.mock("./features/deployment-updates/UpdateAvailableNotice", () => ({ UpdateAvailableNotice: () => null }));
 vi.mock("./useDocumentTitle", () => ({ useDocumentTitle: () => {} }));
 
 import { HomePageContent } from "./routes/index";
@@ -57,6 +66,7 @@ describe("Home prompt route flow", () => {
     container?.remove();
     localStorage.clear();
     testState.seeds.length = 0;
+    testState.draftStorageKeys.length = 0;
     vi.clearAllMocks();
   });
 
@@ -71,6 +81,7 @@ describe("Home prompt route flow", () => {
     );
     expect(Math.max(...testState.seeds.map(({ nonce }) => nonce ?? 0))).toBe(1);
     expect(testState.navigate).toHaveBeenCalledWith({ to: "/", search: {}, replace: true });
-    expect(testState.newGadget).not.toHaveBeenCalled();
+    expect(testState.newWorkspace).not.toHaveBeenCalled();
+    expect(testState.draftStorageKeys).toContain("gadgets:composer-draft:v1:user-a:home");
   });
 });

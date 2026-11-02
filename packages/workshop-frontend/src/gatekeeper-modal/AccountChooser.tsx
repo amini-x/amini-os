@@ -2,8 +2,10 @@ import { useState } from 'react'
 import { Check, Plus, UserCircle } from '@phosphor-icons/react'
 import { AccountDescription, SupportedResource, VendorDescription } from '@gadgets/workshop-shared/gatekeeper'
 
-// Account info as consumed by the chooser. Matches the shape used by GatekeeperModal and the
-// blueprint configure panel.
+/**
+ * Account info as consumed by the chooser. Matches the shape used by GatekeeperModal and the
+ * blueprint configure panel.
+ */
 export type AccountOption = {
   id: number
   description: AccountDescription
@@ -13,10 +15,12 @@ export type AccountOption = {
   credentialsValid: boolean
 }
 
-// Renders a connected-account avatar with graceful fallback. Some vendors (notably Google) hand
-// us short-lived signed CDN URLs for the user's profile photo that can stop working without the
-// credentials themselves expiring; on load failure we fall back to the vendor logo, then a
-// generic user icon.
+/**
+ * Renders a connected-account avatar with graceful fallback. Some vendors (notably Google) hand
+ * us short-lived signed CDN URLs for the user's profile photo that can stop working without the
+ * credentials themselves expiring; on load failure we fall back to the vendor logo, then a
+ * generic user icon.
+ */
 export function AccountAvatar({ avatarUrl, logoUrl }: { avatarUrl: string | undefined, logoUrl: string | undefined }) {
   const [failed, setFailed] = useState(false)
   if (avatarUrl && !failed) {
@@ -80,6 +84,7 @@ export function AccountChooser({
               : []
           const needsAccess = !expired && accountMissing.length > 0
           const granting = grantingAccountId === account.id
+          const grantInProgress = grantingAccountId !== null
           return (
             <div
               key={account.id}
@@ -124,7 +129,7 @@ export function AccountChooser({
                 <button
                   type="button"
                   onClick={() => onGrantAccess?.(account.id)}
-                  disabled={granting}
+                  disabled={grantInProgress}
                   className="shrink-0 cursor-pointer rounded-md border border-kumo-line px-2 py-1 text-[12px] leading-4 font-medium tracking-[-0.2px] text-kumo-default transition-colors hover:bg-kumo-elevated disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   {granting ? 'Opening...' : 'Grant access'}

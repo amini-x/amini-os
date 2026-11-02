@@ -8,9 +8,10 @@ import {
 } from '@phosphor-icons/react'
 import { useKumoToastManager } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from '../../AuthContext'
-import type { GadgetMetadataWithTimestamps, OutputFormatOffer } from '@gadgets/workshop-shared/api'
+import type { WorkspaceMetadataWithTimestamps, OutputFormatOffer } from '@gadgets/workshop-shared/api'
 import { FormatGlyph } from '../format/FormatVisuals'
 import { createFromFormat } from '../format/useOutputFormats'
+import { isImeComposing } from '../../keyboardEvent'
 
 // A ⌘K command palette: jump to a workspace or a primary destination. Because it's keyboard-driven
 // and opened many times a day, it deliberately has *no* open/close animation (instant feels faster
@@ -27,7 +28,7 @@ type Command = {
 
 type BlueprintEntry = { id: string; title: string; recency: number }
 type PaletteData = {
-  gadgets: GadgetMetadataWithTimestamps[]
+  gadgets: WorkspaceMetadataWithTimestamps[]
   blueprints: BlueprintEntry[]
   formats: OutputFormatOffer[]
 }
@@ -146,7 +147,7 @@ export default function CommandPalette({
 
   const [query, setQuery] = useState('')
   const [activeIndex, setActiveIndex] = useState(0)
-  const [gadgets, setGadgets] = useState<GadgetMetadataWithTimestamps[]>(
+  const [gadgets, setGadgets] = useState<WorkspaceMetadataWithTimestamps[]>(
     () => paletteCache?.data.gadgets ?? [],
   )
   const [blueprints, setBlueprints] = useState<BlueprintEntry[]>(
@@ -179,7 +180,7 @@ export default function CommandPalette({
     const isFresh = paletteCache && Date.now() - paletteCache.fetchedAt < PALETTE_CACHE_TTL_MS
     if (!isFresh) {
       Promise.all([
-        authenticatedApi.listGadgets(),
+        authenticatedApi.listWorkspaces(),
         authenticatedApi.listOwnBlueprints(),
         authenticatedApi.listLibraryBlueprints(),
         authenticatedApi.listOutputFormats(),
@@ -311,6 +312,7 @@ export default function CommandPalette({
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      if (isImeComposing(e)) return
       if (e.key === 'ArrowDown') {
         e.preventDefault()
         setActiveIndex((i) => (flat.length ? (i + 1) % flat.length : 0))

@@ -3,7 +3,7 @@
 
 import type { RpcTarget } from "capnweb";
 
-// Vendor id = GATEKEEPER_<NAME> binding suffix (lowercased).
+/** Vendor id = GATEKEEPER_<NAME> binding suffix (lowercased). */
 export const VENDOR_ID = "context";
 
 // ---------------------------------------------------------------------------
@@ -12,27 +12,39 @@ export const VENDOR_ID = "context";
 // Keep these in sync with CONTEXT_LIBRARY_TYPES in library-gatekeeper.ts.
 // ---------------------------------------------------------------------------
 
-// Search result.
+/** Agent-facing read capability over the account's enabled Context collections. */
+export interface ContextLibrary extends RpcTarget {
+  /** Search enabled collections, optionally narrowed to one collection. */
+  search(query: string, opts?: {
+    collectionId?: string; limit?: number;
+  }): Promise<ContextSearchResult[]>;
+  /** List collection discovery metadata, or the contents of a selected collection subtree. */
+  list(opts?: { collectionId?: string; path?: string }): Promise<ContextListing>;
+  /** Read a document by its catalog/list/search ID, or return null when it is unavailable. */
+  read(docId: string): Promise<ContextReadResult | null>;
+}
+
+/** Search result. */
 export type ContextSearchResult = {
-  // Opaque document identifier ("collectionId/path") to pass to read().
+  /** Opaque document identifier ("collectionId/path") to pass to read(). */
   docId: string;
   collectionId?: string;
-  // Document title.
+  /** Document title. */
   title: string;
-  // Path within the collection (e.g. "billing/revenue.md").
+  /** Path within the collection (e.g. "billing/revenue.md"). */
   path?: string;
-  // When/why this document is relevant.
+  /** When/why this document is relevant. */
   description?: string;
-  // A snippet showing the matched region, if available.
+  /** A snippet showing the matched region, if available. */
   snippet?: string;
-  // Relevance score (higher is better).
+  /** Relevance score (higher is better). */
   score?: number;
 };
 
-// A listing entry returned when browsing the content tree.
+/** A listing entry returned when browsing the content tree. */
 export type ContextListingEntry = {
   type: "collection";
-  // A collectionId — pass to list()/search() to see inside it, not to read() (which takes a docId).
+  /** A collectionId — pass to list()/search() to see inside it, not to read() (which takes a docId). */
   id: string;
   title: string;
   description?: string;
@@ -47,18 +59,18 @@ export type ContextListingEntry = {
   path: string;
   name: string;
   description?: string;
-  // MIME type, so the agent can tell text documents from embeddable binary ones (e.g. images).
+  /** MIME type, so the agent can tell text documents from embeddable binary ones (e.g. images). */
   contentType?: string;
 };
 
-// Top-level collections or a collection subtree.
+/** Top-level collections or a collection subtree. */
 export type ContextListing = {
   collectionId?: string;
   path?: string;
   entries: ContextListingEntry[];
 };
 
-// Full document returned by read(); binary content is a data: URI.
+/** Full document returned by read(); binary content is a data: URI. */
 export type ContextReadResult = {
   docId: string;
   title: string;
@@ -67,12 +79,17 @@ export type ContextReadResult = {
   content: string;
 };
 
-// Document IDs join the collection ID and path with a slash.
+/** Document IDs join the collection ID and path with a slash. */
 export function encodeDocId(collectionId: string, path: string): string {
   return `${collectionId}/${path}`;
 }
 
-// Invalid IDs resolve to no document.
+/** The ID prefix every document beside this one shares, trailing slash included. */
+export function docIdRoot(docId: string): string {
+  return docId.slice(0, docId.lastIndexOf("/") + 1);
+}
+
+/** Invalid IDs resolve to no document. */
 export function decodeDocId(docId: string): {collectionId: string; path: string} | null {
   let slashIndex = docId.indexOf("/");
   if (slashIndex < 0) return null;
@@ -85,7 +102,7 @@ export function decodeDocId(docId: string): {collectionId: string; path: string}
 // Stored data model
 // ---------------------------------------------------------------------------
 
-// Collection visibility within a sharing domain.
+/** Collection visibility within a sharing domain. */
 export type ContextCollectionVisibility = "public" | "private";
 export const DEFAULT_GIT_BRANCH = "main";
 
@@ -96,16 +113,16 @@ export type ContextCollectionContent =
   | { source: "git"; remote: string; branch: string; lastRefreshedAt: Date; commit?: string };
 
 export type ContextCollectionMetadata = {
-  // Random hex ID.
+  /** Random hex ID. */
   id: string;
 
-  // Optional emoji icon.
+  /** Optional emoji icon. */
   icon?: string;
 
-  // Human-readable title.
+  /** Human-readable title. */
   title: string;
 
-  // Listed and used by agents to decide relevance.
+  /** Listed and used by agents to decide relevance. */
   description: string;
 
   visibility: ContextCollectionVisibility;
@@ -113,7 +130,7 @@ export type ContextCollectionMetadata = {
   created: Date;
   lastUpdated: Date;
 
-  // Number of documents in this collection.
+  /** Number of documents in this collection. */
   documentCount: number;
 
   content: ContextCollectionContent;
@@ -134,7 +151,7 @@ export type ContextGitTokenCreateResult = {
   remote: string;
 };
 
-// Collection summary for listings.
+/** Collection summary for listings. */
 export type ContextCollectionSummary = {
   id: string;
   title: string;
@@ -145,49 +162,49 @@ export type ContextCollectionSummary = {
   lastUpdated: Date;
 };
 
-// Stored document. Text bodies are literal text; binary bodies are base64 without a data: prefix.
+/** Stored document. Text bodies are literal text; binary bodies are base64 without a data: prefix. */
 export type ContextDocument = {
-  // Primary key within the collection, using "/" separators.
+  /** Primary key within the collection, using "/" separators. */
   path: string;
 
-  // File name derived from the path.
+  /** File name derived from the path. */
   name: string;
 
-  // What this document covers and when to use it.
+  /** What this document covers and when to use it. Values over 16,000 characters are truncated. */
   description: string;
 
-  // Determines whether `body` is text or base64.
+  /** Determines whether `body` is text or base64. */
   contentType: string;
 
-  // Literal text for text content types; base64 for binary ones.
+  /** Literal text for text content types; base64 for binary ones. */
   body: string;
 
-  // Set when this document is a valid skill.
+  /** Set when this document is a valid skill. */
   skillName?: string;
 
   lastUpdated: Date;
 };
 
-// Document info without body.
+/** Document info without body. */
 export type ContextDocumentSummary = {
   path: string;
   name: string;
   description: string;
   contentType: string;
+  /** Set when this document is a valid skill. */
   skillName?: string;
+  /** Set when this document is a SKILL.md whose frontmatter fails validation; says why. */
+  skillError?: string;
   lastUpdated: Date;
 };
 
-// A user's record of one of their own (private) collections.
-export type OwnedCollectionRecord = {
-  id: string;
-  title: string;
-  description: string;
-  icon?: string;
-  lastUpdated: Date;
-};
+/**
+ * An account's role on a private collection. Every role reads all of its content; see
+ * ContextCollectionPermissions for what each may change.
+ */
+export type ContextCollectionRole = "viewer" | "editor" | "owner";
 
-// Collections an account's agents can use: own private plus all public.
+/** Collections in an account's library: those it holds a role on, plus every public one. */
 export type EnabledCollectionInfo = {
   id: string;
   title: string;
@@ -195,6 +212,46 @@ export type EnabledCollectionInfo = {
   icon?: string;
   source: "private" | "public";
   lastUpdated: Date;
+  /** Private collections only: this account's role, and whether anyone else can read it. */
+  membership?: { role: ContextCollectionRole; shared: boolean };
+};
+
+/** What the viewing account may do with one collection. */
+export type ContextCollectionPermissions = {
+  /**
+   * Edit web-managed content and collection details, and manage git mirroring. On a private
+   * collection, also share it as viewer or editor and toggle everyone-viewable.
+   */
+  canEdit: boolean;
+  /** Open the Share dialog: an editable private collection. */
+  canShare: boolean;
+  /** Grant `owner`, and demote or remove owners. */
+  canManageOwners: boolean;
+  /** Delete the whole collection. */
+  canDelete: boolean;
+};
+
+/** One account holding a role on a private collection. */
+export type ContextCollectionMember = {
+  /** Opaque member identifier, passed back to change or remove this member's role. */
+  memberId: string;
+  role: ContextCollectionRole;
+  /**
+   * The Workshop display name snapshotted when they were added. Absent for the account that
+   * created the collection before sharing existed. Presentation only.
+   */
+  displayName?: string;
+  /** Whether this member is the viewing account. */
+  isViewer: boolean;
+};
+
+/** A private collection's sharing state. */
+export type ContextCollectionSharing = {
+  members: ContextCollectionMember[];
+  /** Every account in the sharing domain may read it, without it appearing in their library. */
+  everyoneCanView: boolean;
+  /** False once the last owner's account was disconnected while others still held access. */
+  hasOwner: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -203,8 +260,8 @@ export type EnabledCollectionInfo = {
 
 export const DEFAULT_DOCUMENT_CONTENT_TYPE = "text/markdown";
 
-// UTF-8 bytes of stored body; base64 overhead caps raw binary around 1 MB.
-export const MAX_DOCUMENT_BODY_BYTES = 1_400_000;
+/** Raw stored body bytes, leaving headroom below SQLite's 2 MB serialized-value limit. */
+export const MAX_DOCUMENT_BODY_BYTES = 1_800_000;
 
 // Map of file extensions (without the dot, lowercased) to MIME types we recognize.
 //
@@ -265,7 +322,7 @@ const EXTENSION_CONTENT_TYPES: Record<string, string> = {
   pdf: "application/pdf",
 };
 
-// Derive a MIME type from a path's file extension, defaulting to markdown.
+/** Derive a MIME type from a path's file extension, defaulting to markdown. */
 export function contentTypeFromPath(path: string): string {
   let dot = path.lastIndexOf(".");
   if (dot < 0) return DEFAULT_DOCUMENT_CONTENT_TYPE;
@@ -273,7 +330,7 @@ export function contentTypeFromPath(path: string): string {
   return EXTENSION_CONTENT_TYPES[ext] ?? DEFAULT_DOCUMENT_CONTENT_TYPE;
 }
 
-// Text bodies are literal/searchable; everything else is base64. SVG is treated as an image.
+/** Text bodies are literal/searchable; everything else is base64. SVG is treated as an image. */
 export function isTextContentType(contentType: string): boolean {
   contentType = contentType.split(";", 1)[0].trim().toLowerCase();
   if (contentType.startsWith("text/")) return true;
@@ -285,13 +342,15 @@ export function isTextContentType(contentType: string): boolean {
   );
 }
 
-// Whether a content type is an image we can preview / embed as a data: URI.
+/** Whether a content type is an image we can preview / embed as a data: URI. */
 export function isImageContentType(contentType: string): boolean {
   return contentType.startsWith("image/");
 }
 
-// Whether a content type is Markdown, which the document viewer renders as prose in View mode
-// (all other text is shown as source). Everything else falls back to the source editor.
+/**
+ * Whether a content type is Markdown, which the document viewer renders as prose in View mode
+ * (all other text is shown as source). Everything else falls back to the source editor.
+ */
 export function isMarkdownContentType(contentType: string): boolean {
   return contentType === "text/markdown";
 }
@@ -300,9 +359,9 @@ export function isMarkdownContentType(contentType: string): boolean {
 // Per-user management capability (ContextApi)
 // ---------------------------------------------------------------------------
 
-// Per-account management API exposed to the gatekeeper app iframe.
+/** Per-account management API exposed to the gatekeeper app iframe. */
 export interface ContextApi extends RpcTarget {
-  // Gates creating/editing public collections and offering Git-backed collections.
+  /** Gates creating/editing public collections and offering Git-backed collections. */
   getViewerInfo(): Promise<{ isAdmin: boolean; supportsGitCollections: boolean }>;
 
   createContextCollection(
@@ -320,14 +379,44 @@ export interface ContextApi extends RpcTarget {
   getContextCollectionMetadata(collectionId: string): Promise<ContextCollectionMetadata | null>;
   listContextDocuments(collectionId: string, prefix?: string): Promise<ContextDocumentSummary[]>;
   getContextDocument(collectionId: string, path: string): Promise<ContextDocument | null>;
-  // The document's display name is always derived from its path (the file name), so it's not passed.
+  /** The document's display name is always derived from its path (the file name), so it's not passed. */
   putContextDocument(collectionId: string, path: string, doc: {
     description: string; body: string; contentType?: string;
   }): Promise<void>;
+  /** Creates a skill, rejecting the operation if its directory is already occupied. */
+  createContextSkill(collectionId: string, path: string, doc: {
+    description: string; body: string; contentType?: string;
+  }): Promise<void>;
   deleteContextDocument(collectionId: string, path: string): Promise<void>;
+  /** Atomically deletes a skill and its supporting files. */
+  deleteContextSkill(collectionId: string, manifestPath: string): Promise<void>;
+  /** Atomically deletes a document path and every document below it. */
+  deleteContextDocumentTree(collectionId: string, path: string): Promise<void>;
   moveContextDocument(collectionId: string, fromPath: string, toPath: string): Promise<void>;
-  // Own private collections plus every public one.
+  /** Atomically moves a skill and its supporting files within its collection. */
+  moveContextSkill(collectionId: string, manifestPath: string, directoryPath: string): Promise<void>;
+  /** Atomically renames a skill directory and its manifest name. */
+  renameContextSkill(collectionId: string, manifestPath: string, newName: string): Promise<void>;
+  /** Collections this account holds a role on, plus every public one. */
   listEnabledContextCollections(): Promise<EnabledCollectionInfo[]>;
-  // Whether the viewer may edit this collection: own private collection, or public collection as admin.
-  canWriteContextCollection(collectionId: string): Promise<boolean>;
+  /** What the viewer may do with a collection it can read. */
+  getContextCollectionPermissions(collectionId: string): Promise<ContextCollectionPermissions>;
+
+  // --- Sharing (private collections only) ---
+
+  /** Members and everyone-viewability of a collection the viewer can read. */
+  getContextCollectionSharing(collectionId: string): Promise<ContextCollectionSharing>;
+  /**
+   * Share with the person a Workshop user-picker ticket names. Resolves once the share is durable;
+   * rejects with a message meant for display beside that person.
+   */
+  shareContextCollection(
+    collectionId: string, ticket: string, role: ContextCollectionRole): Promise<void>;
+  setContextCollectionMemberRole(
+    collectionId: string, memberId: string, role: ContextCollectionRole): Promise<void>;
+  /** Remove a member; removing the viewer's own membership leaves the collection. */
+  removeContextCollectionMember(collectionId: string, memberId: string): Promise<void>;
+  /** Give up the viewer's own role, whatever it is; the last owner cannot leave. */
+  leaveContextCollection(collectionId: string): Promise<void>;
+  setContextCollectionEveryoneCanView(collectionId: string, everyoneCanView: boolean): Promise<void>;
 }

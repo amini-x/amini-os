@@ -58,6 +58,9 @@ export const CONFLUENCE_SCOPES = [
   "write:attachment:confluence",
   "delete:attachment:confluence",
   "read:user:confluence",
+  // The content tree (direct children and descendants of a page or folder), which the resource
+  // configurator browses. A grant without it can still be used, with a pages-only tree.
+  "read:hierarchical-content:confluence",
 
   // Classic (v1 fallbacks: search, label writes, attachment upload, restore).
   "search:confluence",
@@ -73,6 +76,9 @@ export const CONFLUENCE_SCOPES = [
   "read:me",
   "offline_access",
 ];
+
+/** The scope that lets the configurator list folders, whiteboards and databases in the content tree. */
+export const HIERARCHY_SCOPE = "read:hierarchical-content:confluence";
 
 export class ConfluenceApiError extends Error {
   status: number;
@@ -97,6 +103,8 @@ export type OAuthGrant = {
   refreshToken?: string;
   /** Absolute epoch-ms expiry of the access token. */
   expiresAt: number;
+  /** The scopes the grant holds, as Atlassian reported them. */
+  scopes?: string[];
 };
 
 export type AccessibleResource = {
@@ -124,7 +132,7 @@ async function postToken(body: Record<string, string>): Promise<OAuthGrant> {
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   const parsed = (await response.json().catch(() => null)) as
-    | { access_token?: string; refresh_token?: string; expires_in?: number; error?: string; error_description?: string }
+    | { access_token?: string; refresh_token?: string; expires_in?: number; scope?: string; error?: string; error_description?: string }
     | null;
   if (!response.ok || !parsed?.access_token) {
     const message = [parsed?.error, parsed?.error_description].filter(Boolean).join(": ") ||
@@ -135,6 +143,7 @@ async function postToken(body: Record<string, string>): Promise<OAuthGrant> {
     accessToken: parsed.access_token,
     refreshToken: parsed.refresh_token,
     expiresAt: Date.now() + (parsed.expires_in ?? 3600) * 1000,
+    ...(typeof parsed.scope === "string" ? { scopes: parsed.scope.split(" ").filter(Boolean) } : {}),
   };
 }
 
@@ -222,6 +231,32 @@ const at = (segments: string[], marker: string): string | undefined => {
   return i >= 0 ? segments[i + 1] : undefined;
 };
 
+/**
+ * The content ID a Confluence short link (`/wiki/x/<tinyId>`) names, or undefined when the URL isn't
+ * one. The tiny ID is the content ID's little-endian bytes in base64, with `/` written `-`, `+`
+ * written `_`, and trailing zero bytes and padding dropped.
+ */
+export function contentIdFromShortLink(url: string): string | undefined {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return undefined;
+  }
+  const match = /^\/wiki\/x\/([A-Za-z0-9_-]{1,12})\/?$/.exec(parsed.pathname);
+  if (!match) return undefined;
+  const base64 = match[1].replace(/-/g, "/").replace(/_/g, "+");
+  let bytes: string;
+  try {
+    bytes = atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "A"));
+  } catch {
+    return undefined;
+  }
+  let id = 0n;
+  for (let i = bytes.length - 1; i >= 0; i--) id = (id << 8n) | BigInt(bytes.charCodeAt(i));
+  return id > 0n ? id.toString() : undefined;
+}
+
 /** Resolves a content ID from a bare numeric ID or a Confluence URL. */
 export function parseConfluenceContentId(idOrUrl: string): string {
   if (/^\d+$/.test(idOrUrl.trim())) return idOrUrl.trim();
@@ -294,12 +329,14 @@ export type ContentResponse = {
   parentType?: string;
   authorId?: string;
   createdAt?: string;
+  /** `live` for a live doc. */
+  subtype?: string | null;
   version?: V2Version;
   body?: V2Body;
   _links?: V2Links;
 };
 
-type SpaceResponse = {
+export type SpaceResponse = {
   id: string;
   key: string;
   name: string;
@@ -307,10 +344,30 @@ type SpaceResponse = {
   status?: string;
   homepageId?: string;
   description?: { plain?: { value?: string } };
+  /** Present with `include-icon`. A personal space's icon is its owner's avatar, with no download link. */
+  icon?: { path?: string; apiDownloadLink?: string };
   _links?: V2Links;
 };
 
 type ChildPageResponse = { id: string; status?: string; title: string; spaceId?: string };
+
+/** The content types whose children Confluence's tree endpoints list. */
+export type TreeParent = "pages" | "folders" | "whiteboards" | "databases" | "embeds";
+
+/**
+ * A node of the content tree, from `direct-children` or `descendants`: a page, folder, whiteboard,
+ * database or embed (Smart Link), in the order Confluence's sidebar shows them.
+ */
+export type TreeNodeResponse = {
+  id: string;
+  title: string;
+  type?: string;
+  status?: string;
+  /** `descendants` only. */
+  parentId?: string;
+  /** `descendants` only: 1 for a direct child. */
+  depth?: number;
+};
 
 type CommentResponse = {
   id: string;
@@ -355,6 +412,27 @@ type V1SearchResult = {
 };
 type V1SearchResponse = { results: V1SearchResult[]; start?: number; limit?: number; size?: number; _links?: { next?: string } };
 
+/** One v1 search result with the expansions `searchWithContext` asks for. */
+export type SearchHit = {
+  /** Space results only. */
+  space?: { key?: string; name?: string; type?: string };
+  content?: {
+    id: string;
+    type?: string;
+    status?: string;
+    title?: string;
+    space?: { key?: string; name?: string; _expandable?: { homepage?: string } };
+    ancestors?: { id: string; type?: string; title?: string }[];
+    /** A page's child pages, as far as one expansion lists them. */
+    children?: { page?: { size?: number } };
+    _links?: { webui?: string };
+  };
+  title?: string;
+  entityType?: string;
+  lastModified?: string;
+  resultGlobalContainer?: { title?: string };
+};
+
 // ---------------------------------------------------------------------------------------------
 // Converters (pure)
 
@@ -370,8 +448,10 @@ const publicUrl = (webui: string | undefined, webBase: string): string => {
   return `${webBase}${webui.startsWith("/") ? "" : "/"}${webui}`;
 };
 
-// v2 webui links look like "/spaces/ENG/pages/123/Title"; derive the space key from them so we
-// don't need an extra lookup (v2 content carries spaceId, not the human key).
+/**
+ * v2 webui links look like "/spaces/ENG/pages/123/Title"; derive the space key from them so we
+ * don't need an extra lookup (v2 content carries spaceId, not the human key).
+ */
 export function spaceKeyFromWebui(webui: string | undefined): string | undefined {
   if (!webui) return undefined;
   const m = webui.match(/\/spaces\/([^/]+)/);
@@ -409,7 +489,7 @@ export function contentToMetadata(c: ContentResponse, webBase: string): ContentM
   };
 }
 
-// A child page (minimal shape) summarized using the parent's space key for the URL.
+/** A child page (minimal shape) summarized using the parent's space key for the URL. */
 export function childPageToSummary(child: ChildPageResponse, webBase: string, spaceKey: string | undefined): ContentSummary {
   return {
     id: child.id,
@@ -484,7 +564,7 @@ function searchResultToSummary(content: NonNullable<V1SearchResult["content"]>, 
   return summary;
 }
 
-// Extract the opaque `cursor` query param from a v2 `_links.next` relative URL.
+/** Extract the opaque `cursor` query param from a v2 `_links.next` relative URL. */
 export function cursorFromNext(next: string | undefined): string | undefined {
   if (!next) return undefined;
   try {
@@ -500,6 +580,10 @@ export function cursorFromNext(next: string | undefined): string | undefined {
 const V2 = "/wiki/api/v2";
 const V1 = "/wiki/rest/api";
 const PAGE_BODY = "body-format=storage";
+
+/** `body: false` reads a page's or post's metadata alone, which is all a title or status check needs. */
+export type ContentReadOptions = { body?: boolean };
+const bodyQuery = (options: ContentReadOptions) => (options.body === false ? "" : `?${PAGE_BODY}`);
 
 export class ConfluenceApi {
   readonly cloudId: string;
@@ -567,48 +651,57 @@ export class ConfluenceApi {
 
   // --- spaces ---
 
-  listSpaces(params: { type?: string; cursor?: string; limit?: number }): Promise<Paged<SpaceResponse>> {
+  listSpaces(params: {
+    type?: string; status?: "current" | "archived"; sort?: string; includeIcon?: boolean;
+    cursor?: string; limit?: number;
+  }): Promise<Paged<SpaceResponse>> {
     return this.#list<SpaceResponse>(`${V2}/spaces`, {
       type: params.type,
+      status: params.status,
+      sort: params.sort,
+      "include-icon": params.includeIcon ? "true" : undefined,
       cursor: params.cursor,
       limit: params.limit,
     });
   }
 
+  /** The space with `key`, with its icon (see {@link SpaceResponse.icon}). */
   async getSpaceByKey(key: string): Promise<SpaceResponse> {
     const res = await this.#request<V2List<SpaceResponse>>(
-      "GET", `${V2}/spaces?keys=${encodeURIComponent(key)}&limit=1`);
+      "GET", `${V2}/spaces?keys=${encodeURIComponent(key)}&limit=1&include-icon=true`);
     const space = res.results[0];
     if (!space) throw new ConfluenceApiError(404, `No such space: ${key}`);
     return space;
   }
 
-  // GET /spaces/{id} returns a single space (same shape as a getSpaceByKey result).
+  /** GET /spaces/{id} returns a single space (same shape as a getSpaceByKey result). */
   getSpaceById(id: string): Promise<SpaceResponse> {
     return this.#request<SpaceResponse>("GET", `${V2}/spaces/${encodeURIComponent(id)}`);
   }
 
   // --- content reads ---
 
-  async getPage(id: string): Promise<ContentResponse> {
-    const c = await this.#request<ContentResponse>("GET", `${V2}/pages/${encodeURIComponent(id)}?${PAGE_BODY}`);
+  /** A page, with its storage-format body unless `body` is false. */
+  async getPage(id: string, options: ContentReadOptions = {}): Promise<ContentResponse> {
+    const c = await this.#request<ContentResponse>("GET", `${V2}/pages/${encodeURIComponent(id)}${bodyQuery(options)}`);
     c.type = "page";
     return c;
   }
 
-  async getBlogPost(id: string): Promise<ContentResponse> {
-    const c = await this.#request<ContentResponse>("GET", `${V2}/blogposts/${encodeURIComponent(id)}?${PAGE_BODY}`);
+  /** A blog post, with its storage-format body unless `body` is false. */
+  async getBlogPost(id: string, options: ContentReadOptions = {}): Promise<ContentResponse> {
+    const c = await this.#request<ContentResponse>("GET", `${V2}/blogposts/${encodeURIComponent(id)}${bodyQuery(options)}`);
     c.type = "blogpost";
     return c;
   }
 
-  // A content ID may be a page or a blog post (distinct v2 resources); try page, then blog post.
-  async getContentById(id: string): Promise<ContentResponse> {
+  /** A content ID may be a page or a blog post (distinct v2 resources); try page, then blog post. */
+  async getContentById(id: string, options: ContentReadOptions = {}): Promise<ContentResponse> {
     try {
-      return await this.getPage(id);
+      return await this.getPage(id, options);
     } catch (err) {
       if (err instanceof ConfluenceApiError && (err.status === 404 || err.status === 400)) {
-        return await this.getBlogPost(id);
+        return await this.getBlogPost(id, options);
       }
       throw err;
     }
@@ -624,12 +717,20 @@ export class ConfluenceApi {
     }).then(tagAll("page"));
   }
 
-  listBlogPostsInSpace(params: { spaceId: string; cursor?: string; limit?: number }): Promise<Paged<ContentResponse>> {
+  listBlogPostsInSpace(params: {
+    spaceId: string; sort?: string; cursor?: string; limit?: number;
+  }): Promise<Paged<ContentResponse>> {
     return this.#list<ContentResponse>(`${V2}/blogposts`, {
       "space-id": params.spaceId,
+      sort: params.sort,
       cursor: params.cursor,
       limit: params.limit,
     }).then(tagAll("blogpost"));
+  }
+
+  /** Up to 250 pages by ID in one read, with their subtype (a live doc's is "live") and version. */
+  listPagesById(ids: string[]): Promise<Paged<ContentResponse>> {
+    return this.#list<ContentResponse>(`${V2}/pages`, { id: ids.join(","), limit: 250 }).then(tagAll("page"));
   }
 
   listChildPages(id: string, params: { cursor?: string; limit?: number }): Promise<Paged<ChildPageResponse>> {
@@ -639,8 +740,76 @@ export class ConfluenceApi {
     });
   }
 
-  // CQL search — no v2 equivalent, so this uses the v1 search endpoint (start/limit paged; we
-  // encode the next start offset as the opaque cursor). Degrades clearly if v1 search is removed.
+  /** A page's or folder's children of every type, in sidebar order. Needs {@link HIERARCHY_SCOPE}. */
+  listDirectChildren(parent: TreeParent, id: string, params: { cursor?: string; limit?: number }): Promise<Paged<TreeNodeResponse>> {
+    return this.#list<TreeNodeResponse>(`${V2}/${parent}/${encodeURIComponent(id)}/direct-children`, {
+      cursor: params.cursor,
+      limit: params.limit,
+    });
+  }
+
+  /** A page's or folder's descendants down to `depth` levels. Needs {@link HIERARCHY_SCOPE}. */
+  listDescendants(parent: TreeParent, id: string, params: { depth: number; limit?: number }): Promise<Paged<TreeNodeResponse>> {
+    return this.#list<TreeNodeResponse>(`${V2}/${parent}/${encodeURIComponent(id)}/descendants`, {
+      depth: params.depth,
+      limit: params.limit,
+    });
+  }
+
+  /**
+   * CQL search returning v1 results whole, with each content result's space (and, through its
+   * expandable link, the space's home page), ancestors and child pages, and titles with their
+   * matches highlighted.
+   */
+  async searchWithContext(cql: string, params: { cursor?: string; limit?: number }): Promise<Paged<SearchHit>> {
+    const start = params.cursor ? Number(params.cursor) : 0;
+    if (!Number.isSafeInteger(start) || start < 0) throw new ConfluenceApiError(400, "That page of results has expired.");
+    const limit = params.limit ?? 25;
+    const query = new URLSearchParams({
+      cql, start: String(start), limit: String(limit), excerpt: "highlight", expand: "content.space,content.ancestors,content.children.page",
+    });
+    let res: { results: SearchHit[]; _links?: { next?: string } };
+    try {
+      res = await this.#request("GET", `${V1}/search?${query}`);
+    } catch (err) {
+      throw degradeIfGone(err, "Confluence search");
+    }
+    return { results: res.results, nextCursor: res._links?.next ? String(start + limit) : undefined };
+  }
+
+  /**
+   * Downloads a space icon from its `apiDownloadLink`. Confluence answers with a redirect to a signed
+   * URL on Atlassian's media service, which is followed only there and without our token, and the
+   * image is read only up to `maxBytes`.
+   */
+  async downloadSpaceIcon(apiDownloadLink: string, maxBytes: number): Promise<{ data: Uint8Array; mediaType: string }> {
+    // Confluence writes the link from the site's root (`/wiki/rest/api/…`), or from `/wiki`.
+    const link = apiDownloadLink.replace(/^\/wiki(?=\/rest\/api\/)/, "");
+    if (!link.startsWith("/rest/api/")) throw new ConfluenceApiError(400, "Not a space icon link.");
+    const url = `${this.#base()}/wiki${link}`;
+    // Confluence answers 406, not its redirect, to a request that accepts only images.
+    let token = await this.#getToken();
+    let response = await this.#send("GET", url, token, { headers: { Accept: "*/*" }, redirect: "manual" });
+    if (response.status === 401 && this.#refresh) {
+      token = await this.#refresh();
+      response = await this.#send("GET", url, token, { headers: { Accept: "*/*" }, redirect: "manual" });
+    }
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("Location");
+      const target = location ? new URL(location, url) : undefined;
+      if (target?.protocol !== "https:" || target.hostname !== MEDIA_HOST) {
+        throw new ConfluenceApiError(502, "A space icon redirected somewhere unexpected.");
+      }
+      response = await fetch(target, { headers: { Accept: "image/*" }, redirect: "error", signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+    }
+    if (!response.ok) throw new ConfluenceApiError(response.status, `Space icon download failed: ${response.status}`);
+    return { data: await readCapped(response, maxBytes), mediaType: response.headers.get("Content-Type") ?? "" };
+  }
+
+  /**
+   * CQL search — no v2 equivalent, so this uses the v1 search endpoint (start/limit paged; we
+   * encode the next start offset as the opaque cursor). Degrades clearly if v1 search is removed.
+   */
   async search(cql: string, params: { cursor?: string; limit?: number }): Promise<Paged<ContentSummary>> {
     const start = params.cursor ? Number(params.cursor) : 0;
     const limit = params.limit ?? 25;
@@ -702,7 +871,7 @@ export class ConfluenceApi {
     await this.#request("DELETE", `${V2}/${path}/${encodeURIComponent(id)}`);
   }
 
-  // Restore from trash has no v2 endpoint; fall back to v1 and degrade if it's gone.
+  /** Restore from trash has no v2 endpoint; fall back to v1 and degrade if it's gone. */
   async restoreContent(id: string): Promise<void> {
     try {
       await this.#json("PUT", `${V1}/content/${encodeURIComponent(id)}?status=trashed`, { status: "current" });
@@ -742,7 +911,7 @@ export class ConfluenceApi {
     return res.results.map(l => l.name);
   }
 
-  // Label writes have no v2 endpoint; use v1 and degrade if it's gone.
+  /** Label writes have no v2 endpoint; use v1 and degrade if it's gone. */
   async addLabel(id: string, name: string): Promise<void> {
     try {
       await this.#json("POST", `${V1}/content/${encodeURIComponent(id)}/label`, [{ prefix: "global", name }]);
@@ -777,7 +946,7 @@ export class ConfluenceApi {
     await this.#request("DELETE", `${V2}/attachments/${encodeURIComponent(id)}`);
   }
 
-  // Attachment upload has no v2 endpoint; use v1 and degrade if it's gone.
+  /** Attachment upload has no v2 endpoint; use v1 and degrade if it's gone. */
   async uploadAttachment(id: string, file: {
     filename: string; mediaType: string; data: Uint8Array; comment?: string;
   }): Promise<AttachmentResponse> {
@@ -796,7 +965,7 @@ export class ConfluenceApi {
     }
   }
 
-  // Downloads attachment bytes via its `downloadLink` (relative to the site /wiki base).
+  /** Downloads attachment bytes via its `downloadLink` (relative to the site /wiki base). */
   async downloadAttachment(downloadLink: string): Promise<{ data: Uint8Array; mediaType: string }> {
     const url = `${this.#base()}/wiki${downloadLink}`;
     let token = await this.#getToken();
@@ -811,6 +980,38 @@ export class ConfluenceApi {
       mediaType: response.headers.get("Content-Type") ?? "application/octet-stream",
     };
   }
+}
+
+const MEDIA_HOST = "api.media.atlassian.com";
+
+// Reads a body, refusing one longer than `maxBytes` rather than buffering it whole.
+async function readCapped(response: Response, maxBytes: number): Promise<Uint8Array> {
+  const declared = Number(response.headers.get("Content-Length"));
+  if (declared > maxBytes) {
+    await response.body?.cancel();
+    throw new ConfluenceApiError(413, "The download is too large.");
+  }
+  const reader = response.body?.getReader();
+  if (!reader) return new Uint8Array();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw new ConfluenceApiError(413, "The download is too large.");
+    }
+    chunks.push(value);
+  }
+  const data = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    data.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return data;
 }
 
 // Tag a fetched content object / list with its kind (v2 omits `type` from page/blogpost objects).

@@ -6,10 +6,10 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { RpcStub } from 'capnweb'
 import {
-  createOpenGadgetError,
-  OPEN_GADGET_ERROR_CODES,
+  createOpenWorkspaceError,
+  OPEN_WORKSPACE_ERROR_CODES,
   type AuthenticatedApi,
-  type GadgetMetadata,
+  type WorkspaceMetadata,
   type Overseer,
 } from '@gadgets/workshop-shared/api'
 import WorkspaceOpenErrorPage from './components/WorkspaceOpenErrorPage'
@@ -34,14 +34,14 @@ function disposableStub<T extends object>(value: T, dispose = vi.fn<() => void>(
 }
 
 function api(overseer: RpcStub<Overseer>): RpcStub<AuthenticatedApi> {
-  return { openGadget: () => overseer } as unknown as RpcStub<AuthenticatedApi>
+  return { openWorkspace: () => overseer } as unknown as RpcStub<AuthenticatedApi>
 }
 
 const METADATA = {
   id: 'workspace-1',
   title: 'Quarterly planning',
   provisional: false,
-} as GadgetMetadata
+} as WorkspaceMetadata
 
 function WorkspaceProbe({ authenticatedApi }: { authenticatedApi: RpcStub<AuthenticatedApi> }) {
   const state = useWorkspaceOpen({
@@ -60,6 +60,7 @@ function WorkspaceProbe({ authenticatedApi }: { authenticatedApi: RpcStub<Authen
       />
     )
   }
+  if (state.error?.kind === 'message') return <p>{state.error.message}</p>
   return <p>{state.metadata?.title}</p>
 }
 
@@ -114,7 +115,7 @@ describe('useWorkspaceOpen', () => {
     const firstSubscriptionDispose = vi.fn<() => void>()
     const firstOverseer = disposableStub({
       subscribeToMetadata: vi.fn<
-        (callback: (metadata: GadgetMetadata) => void) => Promise<RpcStub<{}>>
+        (callback: (metadata: WorkspaceMetadata) => void) => Promise<RpcStub<{}>>
       >(async callback => {
           callback(METADATA)
           return disposableStub({}, firstSubscriptionDispose) as RpcStub<{}>
@@ -123,7 +124,7 @@ describe('useWorkspaceOpen', () => {
     const deniedOverseerDispose = vi.fn<() => void>()
     const deniedOverseer = disposableStub({
       subscribeToMetadata: vi.fn<() => Promise<RpcStub<{}>>>(async () => {
-        throw createOpenGadgetError(OPEN_GADGET_ERROR_CODES.workspaceAccessDenied)
+        throw createOpenWorkspaceError(OPEN_WORKSPACE_ERROR_CODES.workspaceAccessDenied)
       }),
     }, deniedOverseerDispose) as unknown as RpcStub<Overseer>
 
@@ -140,5 +141,23 @@ describe('useWorkspaceOpen', () => {
     expect(document.title).toBe('Cloudflare OS')
     expect(firstSubscriptionDispose).toHaveBeenCalledOnce()
     expect(deniedOverseerDispose).toHaveBeenCalledOnce()
+  })
+
+  it('shows the share-links-disabled page when a new redeemer is refused', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const overseer = disposableStub({
+      subscribeToMetadata: vi.fn<() => Promise<RpcStub<{}>>>(async () => {
+        throw createOpenWorkspaceError(OPEN_WORKSPACE_ERROR_CODES.shareLinksDisabled)
+      }),
+    }) as unknown as RpcStub<Overseer>
+
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+    await act(async () => root!.render(<WorkspaceProbe authenticatedApi={api(overseer)} />))
+
+    expect(container.textContent).toContain('Share links are turned off for this workspace')
+    expect(container.textContent)
+      .toContain('Ask the workspace owner to add you directly, then try again.')
   })
 })

@@ -1,11 +1,19 @@
 import { type CSSProperties, useCallback, useEffect, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
-import { RpcStub, RpcTarget, newMessagePortRpcSession } from 'capnweb'
+import { type RpcPromise, RpcStub, RpcTarget, newMessagePortRpcSession } from 'capnweb'
 import { useNavigate } from '@tanstack/react-router'
-import type { GatekeeperUiFrame } from '@gadgets/workshop-shared/gatekeeper'
+import type {
+  GatekeeperUiFrame,
+  GatekeeperUserSelectionReceiver,
+} from '@gadgets/workshop-shared/gatekeeper'
+import { isHexColor } from '@gadgets/workshop-shared/api'
+import type {
+  GatekeeperAppTheme,
+  GatekeeperAppThemeReceiver,
+} from '@gadgets/workshop-shared/theme'
 import { createRateLimitedCapability } from './rateLimitedCapability'
 import { useTheme } from './ThemeContext'
-import type { ResolvedThemeMode } from './theme'
+import { useServerConfig } from './ServerConfigContext'
 import { forwardTrustedFrameError } from './errorReporting'
 import { useAuthenticatedApi } from './AuthContext'
 import {
@@ -13,11 +21,7 @@ import {
   parseGatekeeperAppWorkspaceTarget,
   type GatekeeperAppWorkspaceTarget,
 } from './gatekeeperAppNavigation'
-
-// A receiver, defined by the sandboxed app, that the host calls to push theme changes into the frame.
-interface ThemeReceiver extends RpcTarget {
-  setThemeMode(mode: ResolvedThemeMode): void
-}
+import GatekeeperUserPickerDialog from './features/gatekeeper-sharing/GatekeeperUserPickerDialog'
 
 // The content-pane rect, in viewport coordinates, that the app pins its page to while the iframe
 // is full-viewport.
@@ -35,6 +39,18 @@ type OpenTarget = (target: GatekeeperAppWorkspaceTarget) => void
 // can no longer see. Deliberately a lookup, not an enumeration: the app learns nothing new.
 type ResolveWorkspaceTitles = (ids: string[]) => Promise<(string | null)[]>
 type OpenPrompt = (prompt: string) => void
+// Opening throws synchronously if refused; returning transfers receiver ownership to the picker.
+type OpenUserPicker = (receiver: RpcStub<GatekeeperUserSelectionReceiver>) => Promise<void>
+type CancelUserPicker = () => void
+
+type UserPicker = {
+  id: number
+  receiver: RpcStub<GatekeeperUserSelectionReceiver>
+  deliveries: Set<RpcPromise<void>>
+  resolve: () => void
+}
+
+const USER_PICKER_CANCELLED = 'Person selection cancelled. A delivery may already have been accepted.'
 
 type OverlayState = 'full' | null
 
@@ -58,9 +74,12 @@ function iframeStyleForOverlay(overlay: OverlayState): CSSProperties {
     return {
       ...baseIframeStyle,
       position: 'fixed',
-      inset: 0,
-      width: '100vw',
-      height: '100vh',
+      top: 'calc(var(--app-top) + env(safe-area-inset-top))',
+      right: 'env(safe-area-inset-right)',
+      bottom: 'calc(var(--app-bottom) + env(safe-area-inset-bottom))',
+      left: 'env(safe-area-inset-left)',
+      width: 'calc(100vw - env(safe-area-inset-left) - env(safe-area-inset-right))',
+      height: 'calc(100vh - var(--app-top) - var(--app-bottom) - env(safe-area-inset-top) - env(safe-area-inset-bottom))',
       zIndex: overlayZIndex,
     }
   }
@@ -82,24 +101,28 @@ class GatekeeperAppHostImpl extends RpcTarget {
   readonly #openTarget: OpenTarget
   readonly #openPrompt: OpenPrompt
   readonly #resolveWorkspaceTitles: ResolveWorkspaceTitles
+  readonly #openUserPicker: OpenUserPicker
+  readonly #cancelUserPicker: CancelUserPicker
   #presenting = false
-  #themeMode: ResolvedThemeMode
-  #themeReceiver: RpcStub<ThemeReceiver> | null = null
+  #theme: GatekeeperAppTheme
+  #themeReceiver: RpcStub<GatekeeperAppThemeReceiver> | null = null
   // Presentation changes are coalesced to a single apply per animation frame (see #applyPending).
   #pendingActive: boolean | null = null
   #pendingResolvers: ((ack: PresentAck) => void)[] = []
   #frameId: number | null = null
 
   constructor(
-    capability: any,
+    capability: unknown,
     present: PresentController,
-    themeMode: ResolvedThemeMode,
+    theme: GatekeeperAppTheme,
     openTarget: OpenTarget,
     openPrompt: OpenPrompt,
     resolveWorkspaceTitles: ResolveWorkspaceTitles,
+    openUserPicker: OpenUserPicker,
+    cancelUserPicker: CancelUserPicker,
   ) {
     super()
-    this.#themeMode = themeMode
+    this.#theme = theme
     const { capability: ui, dispose } = createRateLimitedCapability(capability, {
       maxConcurrency: 8,
       maxCallsPerMinute: 600,
@@ -113,6 +136,8 @@ class GatekeeperAppHostImpl extends RpcTarget {
     this.#openTarget = openTarget
     this.#openPrompt = openPrompt
     this.#resolveWorkspaceTitles = resolveWorkspaceTitles
+    this.#openUserPicker = openUserPicker
+    this.#cancelUserPicker = cancelUserPicker
   }
 
   get ui(): RpcStub<RpcTarget> {
@@ -138,29 +163,54 @@ class GatekeeperAppHostImpl extends RpcTarget {
     this.#openPrompt(normalizeGatekeeperAppPrompt(prompt))
   }
 
-  // The app calls this once to learn the current mode and register a receiver for later changes.
+  // Open the trusted Workshop-owned person picker over the app. The directory search happens in the
+  // parent, and the Workshop mints a single-use ticket for each person the user selects
+  // (AuthenticatedApi.createGatekeeperUserSelection) and delivers it to `receiver.receive()` — to
+  // the iframe, not to the gatekeeper's server. The app decides what a selection is for: it can send
+  // the ticket to its backend at once, or hold it in form state and submit it later, while it is
+  // valid. The promise resolves when the picker closes: after every delivery has settled, or
+  // immediately on cancellation, when deliveries may still be running. Frame teardown also
+  // cancels, but the app then sees its connection close instead. Cancellation cannot undo a
+  // delivery the app may already have accepted. Otherwise it stays pending while open (no timeout).
+  // Only one picker can be open at a time.
+  selectUsers(receiver: RpcStub<GatekeeperUserSelectionReceiver>): Promise<void> {
+    if (typeof receiver?.dup !== 'function') {
+      return Promise.reject(new TypeError('selectUsers requires a receiver capability.'))
+    }
+    // The argument stub is disposed when this call returns. Opening transfers this dup to the
+    // picker, which releases it on close or cancellation; only an opening failure releases it here.
+    const retained = receiver.dup()
+    try {
+      return this.#openUserPicker(retained)
+    } catch (error) {
+      retained[Symbol.dispose]()
+      return Promise.reject(error)
+    }
+  }
+
+  // The app calls this once to learn the current theme and register a receiver for later changes.
   // Apps that don't theme themselves never call it.
-  subscribeTheme(receiver: RpcStub<ThemeReceiver>): ResolvedThemeMode {
+  subscribeTheme(receiver: RpcStub<GatekeeperAppThemeReceiver>): GatekeeperAppTheme {
     this.#themeReceiver?.[Symbol.dispose]?.()
     // The argument stub is disposed when this call returns, so keep our own dup (released in dispose).
     this.#themeReceiver = receiver.dup()
-    return this.#themeMode
+    return this.#theme
   }
 
-  #dropThemeReceiver(receiver: RpcStub<ThemeReceiver>) {
+  #dropThemeReceiver(receiver: RpcStub<GatekeeperAppThemeReceiver>) {
     if (this.#themeReceiver !== receiver) return
     receiver[Symbol.dispose]?.()
     this.#themeReceiver = null
   }
 
-  // Push a new mode to a subscribed app; a no-op until (and unless) the app subscribes.
-  updateTheme(mode: ResolvedThemeMode) {
-    this.#themeMode = mode
+  // Push a new theme to a subscribed app; a no-op until (and unless) the app subscribes.
+  updateTheme(theme: GatekeeperAppTheme) {
+    this.#theme = theme
     const receiver = this.#themeReceiver
     if (!receiver) return
 
     try {
-      Promise.resolve(receiver.setThemeMode(mode)).catch(() => this.#dropThemeReceiver(receiver))
+      Promise.resolve(receiver.setTheme(theme)).catch(() => this.#dropThemeReceiver(receiver))
     } catch {
       this.#dropThemeReceiver(receiver)
     }
@@ -192,6 +242,7 @@ class GatekeeperAppHostImpl extends RpcTarget {
   // Cancel the rate limiter's pending resume timer once this host is no longer in use.
   dispose() {
     this.#disposeRateLimiter()
+    this.#cancelUserPicker()
     this.#themeReceiver?.[Symbol.dispose]?.()
     this.#themeReceiver = null
     if (this.#frameId !== null) {
@@ -208,9 +259,11 @@ class GatekeeperAppHostImpl extends RpcTarget {
   }
 }
 
-// Hosts a gatekeeper's full-page management SPA in a sandboxed, network-isolated iframe. The app
-// talks to the gatekeeper only through the `ui` capability carried over the MessagePort RPC session.
-// The iframe fills its parent container.
+/**
+ * Hosts a gatekeeper's full-page management SPA in a sandboxed, network-isolated iframe. The app
+ * talks to the gatekeeper only through the `ui` capability carried over the MessagePort RPC session.
+ * The iframe fills its parent container.
+ */
 export default function SandboxedGatekeeperApp({ frame, gatekeeperVendorId }: {
   frame: GatekeeperUiFrame,
   gatekeeperVendorId: string,
@@ -223,14 +276,24 @@ export default function SandboxedGatekeeperApp({ frame, gatekeeperVendorId }: {
   const connectedRef = useRef(false)
   const invalidatedRef = useRef(false)
   const [overlay, setOverlay] = useState<OverlayState>(null)
+  // The open picker owns the receiver dup and settles `selectUsers()` on close or cancellation.
+  // State drives rendering; the ref lets callbacks check identity before settling, so late
+  // callbacks from a cancelled picker cannot close a newly opened picker.
+  const [userPicker, setUserPicker] = useState<UserPicker | null>(null)
+  const openPickerRef = useRef<UserPicker | null>(null)
+  const nextPickerId = useRef(0)
   const overlayRef = useRef<OverlayState>(null)
-  // Push the Workshop's resolved light/dark mode to the app whenever it changes.
+  // Push the Workshop's resolved light/dark mode and deployment accent whenever either changes.
   const { resolvedThemeMode } = useTheme()
-  const themeModeRef = useRef(resolvedThemeMode)
-  themeModeRef.current = resolvedThemeMode
+  const configuredAccentColor = useServerConfig()?.accentColor
+  const accentColor = configuredAccentColor && isHexColor(configuredAccentColor)
+    ? configuredAccentColor
+    : null
+  const themeRef = useRef<GatekeeperAppTheme>({ mode: resolvedThemeMode, accentColor })
+  themeRef.current = { mode: resolvedThemeMode, accentColor }
   useEffect(() => {
-    hostRef.current?.updateTheme(resolvedThemeMode)
-  }, [resolvedThemeMode])
+    hostRef.current?.updateTheme({ mode: resolvedThemeMode, accentColor })
+  }, [resolvedThemeMode, accentColor])
 
   const setOverlayPhase = useCallback((next: OverlayState) => {
     if (overlayRef.current === next) return
@@ -269,7 +332,7 @@ export default function SandboxedGatekeeperApp({ frame, gatekeeperVendorId }: {
     if (!entry || Date.now() - entry.at >= WORKSPACE_TITLES_TTL_MS) {
       entry = {
         at: Date.now(),
-        titles: authenticatedApi.listGadgets()
+        titles: authenticatedApi.listWorkspaces()
           .then((gadgets) => new Map(gadgets.map((gadget) => [gadget.id, gadget.title]))),
       }
       titlesRef.current = entry
@@ -285,8 +348,37 @@ export default function SandboxedGatekeeperApp({ frame, gatekeeperVendorId }: {
   const openPrompt = useCallback<OpenPrompt>((prompt) => {
     navigate({ to: '/', search: { prompt } })
   }, [navigate])
-  // The gatekeeper capability is `any`: its method shape is gatekeeper-defined and opaque to us.
-  const capabilityRef = useRef<any>(null)
+  const openUserPicker = useCallback<OpenUserPicker>((receiver) => {
+    if (openPickerRef.current) {
+      throw new Error('A person picker is already open.')
+    }
+    // Promise.withResolvers is not in this package's ES2023 TypeScript lib.
+    let resolve!: () => void
+    const promise = new Promise<void>((resolver) => {
+      resolve = resolver
+    })
+    const open: UserPicker = { id: ++nextPickerId.current, receiver, deliveries: new Set(), resolve }
+    openPickerRef.current = open
+    setUserPicker(open)
+    return promise
+  }, [])
+  // Normal closing waits for deliveries; cancellation releases ownership immediately even if
+  // a receiver never settles. Neither path may dispose or settle the same picker twice.
+  const finishUserPicker = useCallback((open: UserPicker) => {
+    if (openPickerRef.current !== open) return
+    openPickerRef.current = null
+    setUserPicker(null)
+    open.receiver[Symbol.dispose]()
+    for (const delivery of open.deliveries) delivery[Symbol.dispose]()
+    open.deliveries.clear()
+    open.resolve()
+  }, [])
+  const cancelUserPicker = useCallback<CancelUserPicker>(() => {
+    const open = openPickerRef.current
+    if (open) finishUserPicker(open)
+  }, [finishUserPicker])
+  // The gatekeeper-defined capability remains opaque; this host only relays it through `ui`.
+  const capabilityRef = useRef<unknown>(null)
   capabilityRef.current = frame.ui
 
   useEffect(() => {
@@ -312,10 +404,12 @@ export default function SandboxedGatekeeperApp({ frame, gatekeeperVendorId }: {
       const host = new GatekeeperAppHostImpl(
         capabilityRef.current,
         present,
-        themeModeRef.current,
+        themeRef.current,
         openTarget,
         openPrompt,
         resolveWorkspaceTitles,
+        openUserPicker,
+        cancelUserPicker,
       )
       hostRef.current = host
       sessionRef.current = newMessagePortRpcSession(port, host)
@@ -348,19 +442,42 @@ export default function SandboxedGatekeeperApp({ frame, gatekeeperVendorId }: {
     }
     // Re-establish the session if either the HTML or the `ui` capability changes, so a new frame
     // carrying a fresh stub (even with identical HTML) never keeps talking through the stale one.
-  }, [frame.iframeHtml, frame.ui, gatekeeperVendorId, openPrompt, openTarget,
-      present, resolveWorkspaceTitles, setOverlayPhase])
+  }, [frame.iframeHtml, frame.ui, gatekeeperVendorId, cancelUserPicker, openPrompt, openTarget,
+      openUserPicker, present, resolveWorkspaceTitles, setOverlayPhase])
 
   return (
-    <iframe
-      ref={iframeRef}
-      srcDoc={frame.iframeHtml}
-      // allow-scripts: run the app's JS. allow-modals: its beforeunload unsaved-changes guard. Not
-      // allow-same-origin (the frame stays an opaque origin), and the app's CSP keeps connect-src 'none'.
-      sandbox="allow-scripts allow-modals"
-      allow="clipboard-write"
-      title="Gatekeeper app"
-      style={iframeStyleForOverlay(overlay)}
-    />
+    <>
+      <iframe
+        ref={iframeRef}
+        srcDoc={frame.iframeHtml}
+        // allow-scripts: run the app's JS. allow-modals: its beforeunload unsaved-changes guard. Not
+        // allow-same-origin (the frame stays an opaque origin), and the app's CSP keeps connect-src 'none'.
+        sandbox="allow-scripts allow-modals"
+        allow="clipboard-write"
+        title="Gatekeeper app"
+        style={iframeStyleForOverlay(overlay)}
+      />
+      {userPicker && (
+        <GatekeeperUserPickerDialog
+          key={userPicker.id}
+          authenticatedApi={authenticatedApi}
+          gatekeeperId={gatekeeperVendorId}
+          onSelected={async (selection) => {
+            if (openPickerRef.current !== userPicker) {
+              return Promise.reject(new Error(USER_PICKER_CANCELLED))
+            }
+            const delivery = userPicker.receiver.receive(selection)
+            userPicker.deliveries.add(delivery)
+            try {
+              await delivery
+            } finally {
+              if (userPicker.deliveries.delete(delivery)) delivery[Symbol.dispose]()
+            }
+          }}
+          onClose={() => finishUserPicker(userPicker)}
+          onCancel={() => finishUserPicker(userPicker)}
+        />
+      )}
+    </>
   )
 }
